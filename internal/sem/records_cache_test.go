@@ -16,6 +16,7 @@ func storeProviderRecordsForTest(ctx context.Context, repo, providerVersion, tre
 		return err
 	}
 	return transaction.Store(records, summary, SnapshotHeader{
+		SchemaVersion:   SchemaVersion,
 		Provider:        ProviderName,
 		ProviderVersion: providerVersion,
 		RepoKey:         transaction.repositoryKey,
@@ -31,6 +32,8 @@ func TestProviderRecordsCacheTransactionRejectsObservedProvenanceMismatch(t *tes
 		name   string
 		mutate func(*SnapshotHeader)
 	}{
+		{"schema version missing", func(header *SnapshotHeader) { header.SchemaVersion = "" }},
+		{"schema version foreign", func(header *SnapshotHeader) { header.SchemaVersion = "9.9" }},
 		{"commit", func(header *SnapshotHeader) { header.Commit = "commit-b" }},
 		{"tree", func(header *SnapshotHeader) { header.Tree = "tree-b" }},
 		{"repository key", func(header *SnapshotHeader) { header.RepoKey = "gh/example/moved" }},
@@ -45,6 +48,7 @@ func TestProviderRecordsCacheTransactionRejectsObservedProvenanceMismatch(t *tes
 				t.Fatal(err)
 			}
 			header := SnapshotHeader{
+				SchemaVersion:   SchemaVersion,
 				Provider:        ProviderName,
 				ProviderVersion: "test",
 				RepoKey:         transaction.repositoryKey,
@@ -58,6 +62,10 @@ func TestProviderRecordsCacheTransactionRejectsObservedProvenanceMismatch(t *tes
 			}
 			if _, _, hit := transaction.Load(); hit {
 				t.Fatal("provenance-mismatched records reached the cache")
+			}
+			artifact := filepath.Join(transaction.entry.root, transaction.entry.relative)
+			if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+				t.Fatalf("provenance-mismatched records created cache artifact %q: %v", artifact, err)
 			}
 		})
 	}
@@ -74,6 +82,7 @@ func TestProviderRecordsCacheDiscriminatesSameTreeCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := first.Store([]byte("commit-a records\n"), nil, SnapshotHeader{
+		SchemaVersion:   SchemaVersion,
 		Provider:        ProviderName,
 		ProviderVersion: "test",
 		RepoKey:         first.repositoryKey,
@@ -532,6 +541,12 @@ func TestProviderRecordsKeyDiscriminatesRepoIdentity(t *testing.T) {
 // why the env path was easy to leave uncovered.
 func TestSearchSnapshotKeyDiscriminatesEnvFileCap(t *testing.T) {
 	repo := t.TempDir()
+	// The baseline has to be an ACTUALLY uncapped key, so clear the variable
+	// first. Reading the ambient environment made the assertion depend on how the
+	// suite was invoked: run with ENTIRE_GRAPH_MAX_FILES=5 already set, this
+	// "uncapped" key is the capped one and the test fails on a correct build —
+	// the one failure mode a cache-key test must not have.
+	t.Setenv(maxSourceFilesEnv, "")
 	uncapped, err := searchSnapshotKey(repo, "id", "v", "tree", ProviderSnapshotOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -568,6 +583,9 @@ func TestSearchSnapshotKeyDiscriminatesEnvFileCap(t *testing.T) {
 
 func TestProviderRecordsKeyDiscriminatesEnvFileCap(t *testing.T) {
 	repo := t.TempDir()
+	// Same reason as TestSearchSnapshotKeyDiscriminatesEnvFileCap: clear the
+	// variable so the baseline is uncapped whatever the caller's environment.
+	t.Setenv(maxSourceFilesEnv, "")
 	uncapped, err := providerRecordsKey(repo, "id", "v", "commit", "tree", "snapshot", ProviderSnapshotOptions{})
 	if err != nil {
 		t.Fatal(err)

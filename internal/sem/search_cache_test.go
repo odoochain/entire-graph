@@ -121,15 +121,10 @@ func TestSearchCacheLoadersRejectSymlinkEscape(t *testing.T) {
 
 	// Remove the selective artifact written by that best-effort miss. The full
 	// entry remains outside, so this isolates the full-cache fallback read.
-	selectiveKey, err := searchSnapshotKey(repo, full.Header.RepoKey, "test-version", full.Header.Tree, selectiveOptions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	outsideSelective, err := newCacheEntry(outsideCacheDir, "search", searchSnapshotCacheVersion, selectiveKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(outsideSelective.writePath()); err != nil {
+	outsideSelective := selectiveSearchEntryPath(
+		t, outsideCacheDir, repo, full.Header.RepoKey, "test-version", full.Header.Tree, selectiveOptions,
+	)
+	if err := os.Remove(outsideSelective); err != nil {
 		t.Fatal(err)
 	}
 	if _, hit, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test-version", selectiveOptions, cacheDir, false); err != nil {
@@ -140,32 +135,41 @@ func TestSearchCacheLoadersRejectSymlinkEscape(t *testing.T) {
 
 	// Force a build so preindex reaches its separate durability read. That READ must reject the
 	// escaping symlink, because it is what decides whether outside content is treated as this
-	// cache's own. The WRITE that follows must still succeed: the cache directory is caller-owned,
-	// operators legitimately symlink parts of it, and refusing to persist there would break a
-	// working setup to defend against someone who already has write access to the directory.
+	// cache's own. The WRITE that follows must be refused for the same reason and say so: an entry
+	// this reader cannot see is one preindex cannot promise, so reporting the refusal is the only
+	// honest outcome. Persisting anyway is what wrote the artifact through a symlink the
+	// repository could have planted.
 	var persistenceReadErr error
 	forced := options
 	forced.ForceRebuild = true
-	if _, _, err := preindexProviderSnapshotWithPersistenceReader(
+	_, _, persistErr := preindexProviderSnapshotWithPersistenceReader(
 		t.Context(), repo, "test-version", forced, cacheDir,
 		func(entry cacheEntry) (cachedSearchSnapshot, error) {
 			cached, err := readSearchSnapshot(entry)
 			persistenceReadErr = err
 			return cached, err
 		},
-	); err != nil {
-		t.Fatalf("preindex refused to persist beneath a caller-owned symlinked cache dir: %v", err)
+	)
+	if persistErr == nil {
+		t.Fatal("preindex persisted through a symlink out of the cache directory")
+	}
+	if !strings.Contains(persistErr.Error(), "is a symlink") {
+		t.Fatalf("preindex failure does not name the symlinked component: %v", persistErr)
 	}
 	if persistenceReadErr == nil {
 		t.Fatal("preindex persistence read followed a symlink outside the opened root")
 	}
 }
 
-// TestCacheWritesTolerateSymlinkedCacheDirectories pins the deliberate asymmetry: reads are
-// confined to the opened root, writes are not. A cache directory whose family subdirectory is a
-// symlink is a supported operator layout (a larger volume, a shared cache, an escape from a
-// container's writable layer), and the artifact must still be written and read back through it.
-func TestCacheWritesTolerateSymlinkedCacheDirectories(t *testing.T) {
+// A symlinked family subdirectory used to be tolerated on the write side, as a supported operator
+// layout: the family on a larger volume, in a shared cache, outside a container's writable layer.
+// It was never any of those things. Every one of them needs a link that LEAVES the cache
+// directory, and reads go through os.OpenRoot(cacheDir), which refuses exactly that — so the
+// artifact was written on every run and read on none. This pins both halves: the read cannot see
+// an artifact behind such a link even when one is placed there directly, and the write no longer
+// pretends otherwise. Relocating the cache is what --cache-dir is for, and a symlinked cache
+// directory itself still resolves on both sides.
+func TestCacheWritesRefuseSymlinkedFamilyDirectories(t *testing.T) {
 	parent := t.TempDir()
 	cacheDir := filepath.Join(parent, "cache")
 	backing := filepath.Join(parent, "backing")
@@ -183,17 +187,32 @@ func TestCacheWritesTolerateSymlinkedCacheDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeSearchSnapshot(entry, cachedSearchSnapshot{CacheVersion: searchSnapshotCacheVersion, Tree: "through-symlink"}); err != nil {
-		t.Fatalf("write through a caller-owned symlinked cache dir: %v", err)
+	// Place a valid artifact where the link resolves — cache/search/v1/<key> is backing/v1/<key> —
+	// by addressing that path directly, and show the reader still cannot reach it through the
+	// link. That is why the write may be refused: there was never a hit to lose.
+	behindLink, err := newCacheEntry(parent, "backing", "v1", strings.Repeat("c", 64))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(backing, "v1", strings.Repeat("c", 64)+".json.gz")); err != nil {
-		t.Fatalf("artifact did not land in the symlink target: %v", err)
+	if err := writeSearchSnapshot(behindLink, cachedSearchSnapshot{CacheVersion: searchSnapshotCacheVersion, Tree: "planted"}); err != nil {
+		t.Fatalf("seed the link target directly: %v", err)
+	}
+	if _, err := readSearchSnapshot(entry); err == nil {
+		t.Error("read reached an artifact through a symlink out of the cache directory")
+	}
+
+	if err := writeSearchSnapshot(entry, cachedSearchSnapshot{CacheVersion: searchSnapshotCacheVersion, Tree: "through-symlink"}); err == nil {
+		t.Error("write followed a symlink out of the cache directory")
 	}
 }
 
 func TestValidCachedSearchSnapshotKeysRepoAndIgnoresCommit(t *testing.T) {
 	options := ProviderSnapshotOptions{Profile: ProfileFull}
 	snapshot := ProviderSnapshot{Header: SnapshotHeader{
+		// Real snapshots always stamp the schema they were built under (see
+		// newProviderSnapshot); the cache validator now requires it, so a
+		// hand-built header has to carry it too.
+		SchemaVersion:   SchemaVersion,
 		RepoKey:         "github.com/example/repo",
 		Commit:          "old-commit",
 		Tree:            "tree",
@@ -223,6 +242,7 @@ func TestValidCachedSearchSnapshotKeysRepoAndIgnoresCommit(t *testing.T) {
 func TestValidateBuiltSearchSnapshotPinsGraphProvenanceButNotCommit(t *testing.T) {
 	options := ProviderSnapshotOptions{Profile: ProfileFull}
 	want := SnapshotHeader{
+		SchemaVersion:   SchemaVersion,
 		Provider:        ProviderName,
 		ProviderVersion: "test-version",
 		RepoKey:         "github.com/example/repo",
@@ -248,6 +268,8 @@ func TestValidateBuiltSearchSnapshotPinsGraphProvenanceButNotCommit(t *testing.T
 		name   string
 		mutate func(*SnapshotHeader)
 	}{
+		{"schema version missing", func(header *SnapshotHeader) { header.SchemaVersion = "" }},
+		{"schema version foreign", func(header *SnapshotHeader) { header.SchemaVersion = "9.9" }},
 		{"repository key", func(header *SnapshotHeader) { header.RepoKey = "github.com/example/other" }},
 		{"tree", func(header *SnapshotHeader) { header.Tree = "other-tree" }},
 		{"provider", func(header *SnapshotHeader) { header.Provider = "other-provider" }},
@@ -267,7 +289,7 @@ func TestValidateBuiltSearchSnapshotPinsGraphProvenanceButNotCommit(t *testing.T
 
 func TestSearchSnapshotMatchesSelectionPinsRepositoryIdentityAndTree(t *testing.T) {
 	selection := searchFileSelection{repoKey: "github.com/example/repo", tree: "tree"}
-	snapshot := ProviderSnapshot{Header: SnapshotHeader{RepoKey: selection.repoKey, Tree: selection.tree}}
+	snapshot := ProviderSnapshot{Header: SnapshotHeader{SchemaVersion: SchemaVersion, RepoKey: selection.repoKey, Tree: selection.tree}}
 	if !searchSnapshotMatchesSelection(snapshot, selection) {
 		t.Fatal("matching snapshot and selection rejected")
 	}
@@ -562,11 +584,9 @@ func NeedleTarget() bool { return true }
 		Profile:   ProfileSyntaxOnly,
 		OnlyFiles: []string{"target/needle.go"},
 	}
-	selectiveKey, err := searchSnapshotKey(repo, preindexed.Header.RepoKey, "test-version", preindexed.Header.Tree, selectiveProviderOptions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	selectivePath := filepath.Join(cacheDir, "search", searchSnapshotCacheVersion, selectiveKey+".json.gz")
+	selectivePath := selectiveSearchEntryPath(
+		t, cacheDir, repo, preindexed.Header.RepoKey, "test-version", preindexed.Header.Tree, selectiveProviderOptions,
+	)
 	cached, err := SearchRepository(t.Context(), repo, "test-version", "NeedleTarget preindex request", options)
 	if err != nil {
 		t.Fatal(err)
@@ -704,11 +724,9 @@ func NeedleTarget() bool { return true }
 		Profile:   ProfileSyntaxOnly,
 		OnlyFiles: []string{"target/needle.go"},
 	}
-	selectiveKey, err := searchSnapshotKey(repo, preindexed.Header.RepoKey, "test-version", preindexed.Header.Tree, selectiveOptions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	selectivePath := filepath.Join(cacheDir, "search", searchSnapshotCacheVersion, selectiveKey+".json.gz")
+	selectivePath := selectiveSearchEntryPath(
+		t, cacheDir, repo, preindexed.Header.RepoKey, "test-version", preindexed.Header.Tree, selectiveOptions,
+	)
 
 	options := SearchOptions{
 		Profile:         ProfileSyntaxOnly,
@@ -796,9 +814,10 @@ func helper() {}
 	}, cacheDir); err != nil {
 		t.Fatal(err)
 	}
-	full, hit, err := loadCachedCompleteSearchSnapshot(t.Context(), repo, "test-version", ProviderSnapshotOptions{
+	binding, hit, err := loadCachedCompleteSearchSnapshotBinding(t.Context(), repo, "test-version", ProviderSnapshotOptions{
 		Profile: ProfileFull,
 	}, cacheDir)
+	full := binding.snapshot
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +839,7 @@ func helper() {}
 	if _, deriveErr := selectiveSearchSnapshotFromFull(t.Context(), repo, "test-version", selectiveOptions, full); deriveErr == nil {
 		t.Fatal("stale complete snapshot no longer fails derivation; fixture does not simulate a provenance mismatch")
 	}
-	snapshot, cacheHit, err := loadOrDeriveSelectiveSearchSnapshot(t.Context(), repo, "test-version", selectiveOptions, cacheDir, false, full)
+	snapshot, cacheHit, err := loadOrDeriveSelectiveSearchSnapshot(t.Context(), repo, "test-version", selectiveOptions, cacheDir, false, binding)
 	if err != nil {
 		t.Fatalf("warm derivation failure was not treated as soft: %v", err)
 	}

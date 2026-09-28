@@ -61,11 +61,9 @@ func Run(ctx context.Context, opts Options, args []string) error {
 	// have a doc entry — which includes `help` itself, so `help --help` prints
 	// help's own detail view rather than the root listing. A bare `--help` has
 	// no command word and is handled above.
-	if wantsHelp(args[1:]) {
-		if _, ok := findCommandDoc(args[0]); ok {
-			renderCommandHelp(opts.Stdout, args[0])
-			return nil
-		}
+	if doc, ok := findCommandDoc(args[0]); ok && wantsHelp(doc, args[1:]) {
+		renderCommandHelp(opts.Stdout, args[0])
+		return nil
 	}
 
 	switch args[0] {
@@ -89,10 +87,12 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runProviderRecords(ctx, opts, args[1:], "symbols")
 	case "edges":
 		return runProviderRecords(ctx, opts, args[1:], "edges")
-	case "search":
+	case "query", "search":
 		return runSearch(ctx, opts, args[1:])
 	case "index":
 		return runIndex(ctx, opts, args[1:])
+	case "health":
+		return runHealth(ctx, opts, args[1:])
 	case "def":
 		return runDef(ctx, opts, args[1:])
 	case "explain":
@@ -111,9 +111,10 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runInitAgents(opts, args[1:])
 	case "version", "--version", "-v":
 		if len(args) > 1 && args[1] == "--json" {
-			return json.NewEncoder(opts.Stdout).Encode(map[string]string{
-				"provider": sem.ProviderName,
-				"version":  opts.Version,
+			return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(map[string]string{
+				"provider":          sem.ProviderName,
+				"version":           opts.Version,
+				"identity_revision": sem.IdentityRevision,
 			})
 		}
 		fmt.Fprintln(opts.Stdout, opts.Version)
@@ -216,19 +217,33 @@ func runDoctor(ctx context.Context, opts Options, args []string) error {
 	}
 
 	repo, err := resolveRepo(ctx, opts.Env, "")
+	if err == nil {
+		// Snapshot construction converts the resolved repository to an absolute,
+		// cleaned path before deriving either RepoRoot or RepoKey. Doctor is the
+		// preflight for that snapshot, so advertise the same spelling rather than
+		// the caller's possibly-relative ENTIRE_REPO_ROOT value.
+		repo, err = filepath.Abs(repo)
+	}
 	if err != nil {
 		report["repo_root"] = ""
 		report["repo_error"] = err.Error()
 		if asJSON {
-			return json.NewEncoder(opts.Stdout).Encode(report)
+			return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(report)
 		}
 		fmt.Fprintf(opts.Stdout, "repo_root=%s\n", valueOrUnset(""))
 		fmt.Fprintf(opts.Stdout, "repo_error=%s\n", err)
 		return nil
 	}
 	report["repo_root"] = repo
+	// The repo_key and schema_version this binary WILL use are part of the
+	// doctor report so a consumer can verify the seam contract up front. Brain
+	// runs doctor before every snapshot; discovering a repo_key rule mismatch or
+	// an unsupported schema major here costs milliseconds, whereas discovering
+	// it from the finished snapshot costs the whole (up to 30 minute) run.
+	report["repo_key"] = sem.RepoKey(ctx, repo)
+	report["schema_version"] = sem.SchemaVersion
 	if asJSON {
-		return json.NewEncoder(opts.Stdout).Encode(report)
+		return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(report)
 	}
 	fmt.Fprintf(opts.Stdout, "repo_root=%s\n", repo)
 	return nil
@@ -238,7 +253,7 @@ func runCapabilities(opts Options, args []string) error {
 	if len(args) != 1 || args[0] != "--json" {
 		return errors.New("capabilities requires --json")
 	}
-	return json.NewEncoder(opts.Stdout).Encode(sem.Capabilities())
+	return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(sem.Capabilities())
 }
 
 func runProviderRecords(ctx context.Context, opts Options, args []string, mode string) error {
@@ -254,17 +269,21 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	}
 	filterActive := flags.To != "" || flags.From != "" || len(flags.Relation) > 0
 	compact := flags.Format == "compact-ndjson"
-	if flags.Format != "ndjson" && !compact {
+	scip := flags.Format == "scip"
+	if flags.Format != "ndjson" && !compact && !scip {
 		if mode == "snapshot" {
-			return fmt.Errorf("%s requires --format ndjson or compact-ndjson", mode)
+			return fmt.Errorf("%s requires --format ndjson, compact-ndjson, or scip", mode)
 		}
 		return fmt.Errorf("%s requires --format ndjson", mode)
 	}
-	if compact && mode != "snapshot" {
-		return errors.New("--format compact-ndjson is only valid for snapshot")
+	if (compact || scip) && mode != "snapshot" {
+		return fmt.Errorf("--format %s is only valid for snapshot", flags.Format)
 	}
-	if compact && filterActive {
-		return errors.New("--format compact-ndjson requires a complete snapshot; remove --to/--from/--relation")
+	if (compact || scip) && filterActive {
+		return fmt.Errorf("--format %s requires a complete snapshot; remove --to/--from/--relation", flags.Format)
+	}
+	if scip && flags.Progress {
+		return errors.New("--format scip cannot be combined with --progress; stderr is reserved for the JSON omission note")
 	}
 	repo, err := resolveRepo(ctx, opts.Env, flags.Repo)
 	if err != nil {
@@ -295,9 +314,25 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 			)
 		}
 	}
-	// Stream records straight to stdout so peak memory does not scale with the
-	// relation count on large repositories.
+	// Native and compact encoders stream records directly. SCIP must collect the
+	// complete graph before writing its single protobuf Index message.
+	var scipEncoder *sem.SCIPSnapshotEncoder
 	newRecordEncoder := func(out io.Writer) func(any) error {
+		if scip {
+			// NOT wrapped. `--format scip` writes a binary protobuf Index, and the C1
+			// rewrite is defined over a TEXT stream: it would rewrite any 0xc2 0x8X
+			// pair the wire format happens to contain -- a varint, a length prefix, a
+			// UTF-8 name -- into six ASCII bytes, and the result no longer parses as
+			// an Index at all. A hostile pathname in this stream reaches a terminal
+			// only after a consumer has decoded the protobuf and chosen to render it,
+			// which is that consumer's escape to apply, not this encoder's.
+			scipEncoder = sem.NewSCIPSnapshotEncoder(out, "")
+			return scipEncoder.Encode
+		}
+		// Wrapped once here rather than in either branch below: both encoders write
+		// repository-controlled pathnames and entity names, and a snapshot carries no
+		// source text, so a hostile PATHNAME is the only C1 these streams can hold.
+		out = termsafe.NewJSONWriter(out)
 		if compact {
 			return sem.NewCompactSnapshotEncoder(out).Encode
 		}
@@ -306,6 +341,13 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		return encoder.Encode
 	}
 	encodeRecord := newRecordEncoder(opts.Stdout)
+	if scipEncoder != nil {
+		// The version is read inside the snapshot build, through the reader that
+		// is already validated, bounded and pinned to this snapshot's revision.
+		// Reading it here instead would run Git before the metadata preflight and
+		// touch the filesystem without the provider's guards.
+		options.ProjectVersion = scipEncoder.SetProjectVersion
+	}
 
 	// Targeted edge query: when --to/--from/--relation is set, emit only matching
 	// relations (plus header/summary), never files/symbols. Turns "callers of X"
@@ -361,7 +403,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	// expensive re-index. It is deliberately bypassed for --worktree and, by
 	// returning above, for targeted queries.
 	cacheDir := resolveCacheDir(flags.CacheDir, opts.Env.PluginDataDir)
-	useCache := !flags.DisableCache && !flags.Worktree && cacheDir != ""
+	useCache := !flags.DisableCache && !flags.Worktree && !scip && cacheDir != ""
 	var commit, tree string
 	cacheContext := ctx
 	if useCache {
@@ -402,7 +444,12 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	}
 	if recordsCache != nil {
 		if records, cachedSummary, hit := recordsCache.Load(); hit {
-			if _, err := opts.Stdout.Write(records); err != nil {
+			// Replayed bytes need the same wrap the encoder below gets. This path does
+			// not go through encodeRecord at all, so a cache entry written before the
+			// C1 rule existed — or by any build that predates it — would stream the
+			// repository's raw control straight to the terminal on every hit. Escaping
+			// is idempotent, so a clean entry passes through unchanged.
+			if _, err := termsafe.NewJSONWriter(opts.Stdout).Write(records); err != nil {
 				return err
 			}
 			warnIfPartial(opts.Stderr, flags.Worktree, cachedSummary)
@@ -412,7 +459,14 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 
 	// On a miss, tee the serialized record stream into a buffer so we can persist it after
 	// a successful run without a second pass over the graph.
-	var recordBuf bytes.Buffer
+	//
+	// BOUNDED, because the cache is on by default: resolveCacheDir falls back to the user cache
+	// directory, so useCache is true for every ordinary committed snapshot/symbols/edges run and this
+	// tee is no longer the opt-in it was written as. An unbounded tee makes a streaming command hold
+	// its ENTIRE output in memory — proportional to the whole graph, on exactly the large repositories
+	// the streaming contract exists for. Past the cap the buffer is released and the entry is not
+	// stored: the cache is best effort, the stream is not.
+	recordBuf := boundedRecordBuffer{limit: providerRecordsCacheMaxBytes}
 	if recordsCache != nil {
 		encodeRecord = newRecordEncoder(io.MultiWriter(opts.Stdout, &recordBuf))
 	}
@@ -425,12 +479,79 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	}); err != nil {
 		return err
 	}
-	warnIfPartial(opts.Stderr, flags.Worktree, summary)
-	if recordsCache != nil {
+	if scipEncoder != nil {
+		if err := writeSCIPOmissionNote(opts.Stderr, scipOmissionNoteWithSummary(scipEncoder.OmissionNote(), summary)); err != nil {
+			return err
+		}
+	} else {
+		warnIfPartial(opts.Stderr, flags.Worktree, summary)
+	}
+	if recordsCache != nil && !recordBuf.overflowed {
 		// Best effort: a failed cache write never fails the command.
-		_ = recordsCache.Store(recordBuf.Bytes(), summary, snapshotHeader)
+		_ = recordsCache.Store(recordBuf.buffer.Bytes(), summary, snapshotHeader)
 	}
 	return nil
+}
+
+// providerRecordsCacheMaxBytes caps the in-memory capture of a cold run's records. A var rather than
+// a const so a test can shrink it to a size a fixture can actually exceed.
+var providerRecordsCacheMaxBytes = 64 << 20
+
+// boundedRecordBuffer accumulates the record stream up to a byte limit and then stops, releasing what
+// it held and remembering that it did. Writes ALWAYS report success: this sits inside the
+// io.MultiWriter that also feeds stdout, and a short write there would abort the stream the command
+// exists to produce. Giving up on the cache entry is the correct trade; giving up on the output is
+// not.
+type boundedRecordBuffer struct {
+	buffer     bytes.Buffer
+	limit      int
+	overflowed bool
+}
+
+func (b *boundedRecordBuffer) Write(records []byte) (int, error) {
+	if b.overflowed {
+		return len(records), nil
+	}
+	if b.buffer.Len()+len(records) > b.limit {
+		b.overflowed = true
+		// The entry will never be stored, so nothing here is worth the memory any longer.
+		b.buffer = bytes.Buffer{}
+		return len(records), nil
+	}
+	return b.buffer.Write(records)
+}
+
+func scipOmissionNoteWithSummary(note sem.SCIPOmissionNote, summary *sem.SnapshotSummary) sem.SCIPOmissionNote {
+	if summary == nil {
+		return note
+	}
+	note.WarningCount = len(summary.Warnings)
+	note.PartialFailureCount = len(summary.PartialFailures)
+	// The records themselves, not just how many. SCIP cannot represent a file
+	// that was discovered but not parsed, so without these the note is the only
+	// place that information could have survived, and it was being reduced to an
+	// integer.
+	note.PartialFailures = summary.PartialFailures
+	// Which languages were only inventoried, so a consumer can scope trust per
+	// language the way the feed contract expects.
+	note.LanguageTiers = summary.LanguageTiers
+	level := summary.Stats.CompletenessLevel
+	if level == "" || level == "ok" {
+		return note
+	}
+	note.PartialSnapshot = true
+	note.CompletenessLevel = level
+	return note
+}
+
+func writeSCIPOmissionNote(w io.Writer, note sem.SCIPOmissionNote) error {
+	// The note is the one TEXT stream `--format scip` writes, and it is written to
+	// a terminal. It is wrapped for the same structural reason every other machine
+	// encoder here is: a sink left unwrapped is the one the next field added to
+	// this record forgets about.
+	encoder := json.NewEncoder(termsafe.NewJSONWriter(w))
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(note)
 }
 
 // warnIfPartial prints a loud stderr banner when the snapshot did not fully cover
@@ -689,6 +810,9 @@ func runCommit(ctx context.Context, opts Options, args []string) error {
 	if len(rest) > 1 {
 		return errors.New("commit accepts at most one revision")
 	}
+	if err := validateRevision("commit", rev); err != nil {
+		return err
+	}
 	repo, err := resolveRepo(ctx, opts.Env, flags.Repo)
 	if err != nil {
 		return err
@@ -732,6 +856,37 @@ func runAnalyze(ctx context.Context, opts Options, args []string) error {
 	return runDiff(ctx, opts, args)
 }
 
+// validateRevision rejects a revision value that Git would read as an option instead.
+//
+// Every revision this package accepts is eventually spliced into a git argv — `git diff -z
+// --raw --find-renames <base> <head> --` in gitutil.ChangedFiles, `git rev-parse
+// <rev>^` in gitutil.FirstParent, `git show <rev>^{tree}:<path>` in gitutil.ShowFile. Git
+// parses options anywhere ahead of `--`, so a value beginning with '-' stops being a revision
+// and becomes a flag of the command it lands in: `diff --base '--output=FILE'` exited 0 having
+// truncated FILE and replaced it with git's own name-status output (CWE-88), and `commit
+// '--output=FILE'` reached the same argv because `git rev-parse '--output=FILE^'` does not
+// fail first.
+//
+// Refusing at the boundary costs nothing legitimate. Values beginning with "--" are always
+// Git options; bare "-" is ambiguous with git's path/option syntax. Single-hyphen refs such as
+// "-foo" are valid and must not be rejected here — gitutil uses "--end-of-options" elsewhere
+// when splicing user paths into git argv.
+func validateRevision(name, rev string) error {
+	if rev == "" {
+		return fmt.Errorf("%s requires a revision", name)
+	}
+	if strings.HasPrefix(rev, "--") {
+		return fmt.Errorf("%s %q is not a revision: a revision cannot begin with %q, which Git would read as an option", name, rev, "--")
+	}
+	if rev == "-" {
+		return fmt.Errorf("%s %q is not a revision: bare %q is ambiguous with git's path/option syntax", name, rev, "-")
+	}
+	if strings.ContainsRune(rev, '\x00') {
+		return fmt.Errorf("%s %q is not a revision: a revision cannot contain a NUL byte", name, rev)
+	}
+	return nil
+}
+
 // diffFlags is the parsed argument set for `diff` and its `analyze` alias.
 type diffFlags struct {
 	common commonFlags
@@ -752,15 +907,34 @@ type diffFlags struct {
 //
 // Paths that genuinely look like flags still work: that is what the documented `-- path...`
 // separator is for.
+// diffValueFlags are the `diff`/`analyze` flags whose value is the NEXT argument: the two
+// parseCommonFlags consumes and the two the loop below does. It exists only for the separator scan
+// above, which runs before either parser and so cannot ask them.
+var diffValueFlags = map[string]bool{
+	"--repo":        true,
+	"--max-seconds": true,
+	"--base":        true,
+	"--head":        true,
+}
+
 func parseDiffFlags(args []string) (diffFlags, []string, error) {
 	parsed := diffFlags{base: "HEAD~1", head: "HEAD"}
 
 	// Split on `--` here rather than letting parseCommonFlags consume it: that function flattens
 	// everything after the separator into rest, which would leave a literal path named `--base`
 	// indistinguishable from the real flag.
+	//
+	// Skipping each value-taking flag's value is what keeps `--` a separator rather than a pattern:
+	// `diff --repo --` addresses a repository directory literally named `--`, and a raw scan cut the
+	// arguments off in front of it and failed with "--repo requires a value" — with no `--repo=--`
+	// spelling to fall back on, because these parsers accept no `=` form.
 	flagArgs, literalPaths := args, []string(nil)
-	for i, arg := range args {
-		if arg == "--" {
+	for i := 0; i < len(args); i++ {
+		if diffValueFlags[args[i]] {
+			i++
+			continue
+		}
+		if args[i] == "--" {
 			flagArgs, literalPaths = args[:i], args[i+1:]
 			break
 		}
@@ -780,11 +954,17 @@ func parseDiffFlags(args []string) (diffFlags, []string, error) {
 			if i >= len(rest) {
 				return diffFlags{}, nil, errors.New("--base requires a value")
 			}
+			if err := validateRevision("--base", rest[i]); err != nil {
+				return diffFlags{}, nil, err
+			}
 			parsed.base = rest[i]
 		case "--head":
 			i++
 			if i >= len(rest) {
 				return diffFlags{}, nil, errors.New("--head requires a value")
+			}
+			if err := validateRevision("--head", rest[i]); err != nil {
+				return diffFlags{}, nil, err
 			}
 			parsed.head = rest[i]
 		default:
@@ -1047,7 +1227,7 @@ func printResult(out io.Writer, result sem.Result, asJSON bool, producerVersion 
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(out, string(encoded))
+		fmt.Fprintln(termsafe.NewJSONWriter(out), string(encoded))
 		return nil
 	}
 	sem.WriteText(out, result)

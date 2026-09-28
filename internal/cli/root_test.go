@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/entireio/entire-graph/internal/sem"
+	scippb "github.com/scip-code/scip/bindings/go/scip"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestResolveRepoHonorsInheritedGitCeiling(t *testing.T) {
@@ -257,6 +260,9 @@ func TestProviderJSONCommands(t *testing.T) {
 	if !strings.Contains(capabilitiesOut.String(), `"compact_snapshot_ndjson_v1":true`) {
 		t.Fatalf("capabilities omit compact snapshot support:\n%s", capabilitiesOut.String())
 	}
+	if !strings.Contains(capabilitiesOut.String(), `"scip_snapshot_experimental":true`) {
+		t.Fatalf("capabilities omit scip snapshot support:\n%s", capabilitiesOut.String())
+	}
 }
 
 func TestProviderProfileFlag(t *testing.T) {
@@ -328,7 +334,7 @@ def check_token(token):
 		if err := json.Unmarshal([]byte(lines[0]), &header); err != nil {
 			t.Fatalf("%s invalid header json %q: %v", tt.command, lines[0], err)
 		}
-		if header["schema_version"] != "1.1" || header["provider"] != "entire-graph" {
+		if header["schema_version"] != "1.3" || header["provider"] != "entire-graph" {
 			t.Fatalf("%s header = %#v", tt.command, header)
 		}
 		seenTypes := map[string]bool{}
@@ -380,7 +386,7 @@ func TestSnapshotAcceptsNoNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), `"schema_version":"1.1"`) {
+	if !strings.Contains(out.String(), `"schema_version":"1.3"`) {
 		t.Fatalf("snapshot output:\n%s", out.String())
 	}
 }
@@ -394,7 +400,7 @@ func TestSnapshotAcceptsWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), `"schema_version":"1.1"`) {
+	if !strings.Contains(out.String(), `"schema_version":"1.3"`) {
 		t.Fatalf("snapshot output:\n%s", out.String())
 	}
 }
@@ -469,7 +475,7 @@ func TestSnapshotCompactNDJSONRoundTripsToNativeRecords(t *testing.T) {
 		t.Fatalf("canonical semantic hash = %s, want %s", got, want)
 	}
 	var decoded []any
-	if err := sem.DecodeCompactSnapshot(bytes.NewReader(compact.Bytes()), func(record any) error {
+	if _, err := sem.DecodeCompactSnapshot(bytes.NewReader(compact.Bytes()), func(record any) error {
 		decoded = append(decoded, record)
 		return nil
 	}); err != nil {
@@ -502,22 +508,126 @@ func TestSnapshotNDJSONRemainsDefaultObjectFormat(t *testing.T) {
 }
 
 func TestCompactNDJSONIsSnapshotOnly(t *testing.T) {
+	testSnapshotFormatIsSnapshotOnly(t, "compact-ndjson")
+}
+
+func TestSnapshotSCIPIsSnapshotOnly(t *testing.T) {
+	testSnapshotFormatIsSnapshotOnly(t, "scip")
+}
+
+func testSnapshotFormatIsSnapshotOnly(t *testing.T, format string) {
+	t.Helper()
 	repo := t.TempDir()
 	write(t, repo, "main.go", "package sample\nfunc main() {}\n")
 	for _, command := range []string{"symbols", "edges"} {
-		err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: io.Discard}, []string{command, "--repo", repo, "--worktree", "--format", "compact-ndjson"})
+		err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: io.Discard}, []string{command, "--repo", repo, "--worktree", "--format", format})
 		if err == nil || !strings.Contains(err.Error(), "only valid for snapshot") {
-			t.Fatalf("%s compact format error = %v", command, err)
+			t.Fatalf("%s %s format error = %v", command, format, err)
 		}
 	}
 }
 
 func TestCompactNDJSONRejectsTargetedRelationFilters(t *testing.T) {
+	testSnapshotFormatRejectsTargetedRelationFilters(t, "compact-ndjson")
+}
+
+func TestSnapshotSCIPRejectsTargetedRelationFilters(t *testing.T) {
+	testSnapshotFormatRejectsTargetedRelationFilters(t, "scip")
+}
+
+func testSnapshotFormatRejectsTargetedRelationFilters(t *testing.T, format string) {
+	t.Helper()
 	repo := t.TempDir()
 	write(t, repo, "main.go", "package sample\nfunc caller() { callee() }\nfunc callee() {}\n")
-	err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: io.Discard}, []string{"snapshot", "--repo", repo, "--worktree", "--format", "compact-ndjson", "--from", "caller"})
+	err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: io.Discard}, []string{"snapshot", "--repo", repo, "--worktree", "--format", format, "--from", "caller"})
 	if err == nil || !strings.Contains(err.Error(), "requires a complete snapshot") {
-		t.Fatalf("targeted compact format error = %v", err)
+		t.Fatalf("targeted %s format error = %v", format, err)
+	}
+}
+
+func TestSnapshotSCIPReservesStderrForOmissionNote(t *testing.T) {
+	repo := t.TempDir()
+	write(t, repo, "main.go", "package sample\nfunc main() {}\n")
+	err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: io.Discard, Stderr: io.Discard}, []string{"snapshot", "--repo", repo, "--worktree", "--format", "scip", "--progress"})
+	if err == nil || !strings.Contains(err.Error(), "stderr is reserved for the JSON omission note") {
+		t.Fatalf("scip progress error = %v", err)
+	}
+}
+
+func TestSnapshotSCIPEmitsBinaryIndexAndOmissionNote(t *testing.T) {
+	repo := t.TempDir()
+	write(t, repo, "main.go", "package sample\n\nfunc caller() { callee() }\nfunc callee() {}\n")
+
+	var stdout, stderr bytes.Buffer
+	err := Run(t.Context(), Options{Version: "scip-test", Env: EntireEnv{RepoRoot: repo}, Stdout: &stdout, Stderr: &stderr}, []string{"snapshot", "--repo", repo, "--worktree", "--format", "scip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() == 0 || bytes.HasPrefix(stdout.Bytes(), []byte("{")) || bytes.HasPrefix(stdout.Bytes(), []byte(`["h"`)) {
+		t.Fatalf("scip output does not look binary: %q", stdout.Bytes())
+	}
+	var index scippb.Index
+	if err := proto.Unmarshal(stdout.Bytes(), &index); err != nil {
+		t.Fatalf("scip output is not a valid Index protobuf: %v", err)
+	}
+	if got := index.GetMetadata().GetToolInfo().GetName(); got != sem.ProviderName {
+		t.Fatalf("tool name = %q, want %q", got, sem.ProviderName)
+	}
+	if got := index.GetMetadata().GetToolInfo().GetArguments(); !strings.Contains(strings.Join(got, " "), "--worktree") {
+		t.Fatalf("scip metadata omits worktree provenance: %#v", got)
+	}
+	documents := map[string]*scippb.Document{}
+	displayNames := map[string]bool{}
+	references := 0
+	// This fixture declares no manifest version, so every symbol must carry the
+	// unversioned fallback. Worktree provenance is asserted through the omission
+	// note below, not through the package version, which no longer encodes it.
+	unversionedSymbols := 0
+	for _, doc := range index.GetDocuments() {
+		documents[doc.GetRelativePath()] = doc
+		for _, info := range doc.GetSymbols() {
+			displayNames[info.GetDisplayName()] = true
+			parsed, err := scippb.ParseSymbol(info.GetSymbol())
+			if err != nil {
+				t.Fatalf("invalid SCIP symbol %q: %v", info.GetSymbol(), err)
+			}
+			if parsed.GetPackage().GetVersion() == sem.ScipProjectVersionUnknown {
+				unversionedSymbols++
+			}
+		}
+		for _, occurrence := range doc.GetOccurrences() {
+			if occurrence.GetSymbolRoles()&int32(scippb.SymbolRole_Definition) == 0 {
+				references++
+			}
+		}
+	}
+	if documents["main.go"] == nil || documents["main.go"].GetLanguage() != "Go" || !displayNames["caller"] || !displayNames["callee"] || references == 0 || unversionedSymbols == 0 {
+		t.Fatalf("scip index omitted expected navigation facts: docs=%v names=%v references=%d unversioned_symbols=%d", documents, displayNames, references, unversionedSymbols)
+	}
+	var note sem.SCIPOmissionNote
+	if err := json.Unmarshal(bytes.TrimSpace(stderr.Bytes()), &note); err != nil {
+		t.Fatalf("stderr omission note is not JSON: %q: %v", stderr.String(), err)
+	}
+	if note.RecordType != "scip_omissions" || note.Format != "scip" || note.EmittedDefinitions == 0 || !note.WorktreeSnapshot || note.WarningCount == 0 {
+		t.Fatalf("unexpected scip omission note: %#v", note)
+	}
+}
+
+func TestSCIPOmissionNoteWithSummaryCapturesPartialState(t *testing.T) {
+	ok := &sem.SnapshotSummary{Stats: sem.ProviderStats{CompletenessLevel: "ok"}}
+	note := scipOmissionNoteWithSummary(sem.SCIPOmissionNote{Format: "scip"}, ok)
+	if note.PartialSnapshot {
+		t.Fatalf("clean summary marked partial: %#v", note)
+	}
+
+	partial := &sem.SnapshotSummary{
+		Warnings:        []sem.ProviderWarning{{Code: "W"}},
+		PartialFailures: []sem.PartialFailure{{Code: "E"}},
+		Stats:           sem.ProviderStats{CompletenessLevel: "degraded"},
+	}
+	note = scipOmissionNoteWithSummary(sem.SCIPOmissionNote{Format: "scip"}, partial)
+	if !note.PartialSnapshot || note.CompletenessLevel != "degraded" || note.WarningCount != 1 || note.PartialFailureCount != 1 {
+		t.Fatalf("partial summary not captured in scip note: %#v", note)
 	}
 }
 
@@ -933,7 +1043,7 @@ func TestProviderCommandsAcceptIgnoreFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", command, err)
 		}
-		if !strings.Contains(out.String(), `"schema_version":"1.1"`) {
+		if !strings.Contains(out.String(), `"schema_version":"1.3"`) {
 			t.Fatalf("%s output missing header:\n%s", command, out.String())
 		}
 		if strings.Contains(out.String(), "ignored.py") || strings.Contains(out.String(), "ignored") {
@@ -962,7 +1072,7 @@ func TestProviderCommandsAcceptIncludeFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", command, err)
 		}
-		if !strings.Contains(out.String(), `"schema_version":"1.1"`) {
+		if !strings.Contains(out.String(), `"schema_version":"1.3"`) {
 			t.Fatalf("%s output missing header:\n%s", command, out.String())
 		}
 		if !strings.Contains(out.String(), "reopened") {
@@ -1054,7 +1164,7 @@ func TestDiffJSONIncludesSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), `"schema_version": "1.1"`) {
+	if !strings.Contains(out.String(), `"schema_version": "1.3"`) {
 		t.Fatalf("diff json missing schema_version:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), `"producer_version": "9.9.9-test"`) {
@@ -1068,8 +1178,8 @@ func TestDiffJSONIncludesSchemaVersion(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
 		t.Fatalf("diff json invalid:\n%s\n%v", out.String(), err)
 	}
-	if payload.SchemaVersion != "1.1" {
-		t.Fatalf("schema_version = %q, want 1.1", payload.SchemaVersion)
+	if payload.SchemaVersion != "1.3" {
+		t.Fatalf("schema_version = %q, want 1.2", payload.SchemaVersion)
 	}
 	if payload.ProducerVersion != "9.9.9-test" {
 		t.Fatalf("producer_version = %q, want 9.9.9-test", payload.ProducerVersion)
@@ -1285,6 +1395,11 @@ func TestParseDiffFlagsSeparatesUnknownFlagsFromPaths(t *testing.T) {
 			base: "HEAD~1", head: "HEAD",
 			paths: []string{"--base"},
 		},
+		{
+			name: "tag ref beginning with hyphen",
+			args: []string{"--base", "-foo", "--head", "HEAD"},
+			base: "-foo", head: "HEAD",
+		},
 	}
 
 	for _, test := range tests {
@@ -1329,5 +1444,204 @@ func TestDiffRejectsUnknownFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--jsonn") {
 		t.Errorf("error %q does not name the offending flag", err)
+	}
+}
+
+// TestParseDiffFlagsRejectsOptionShapedRevision is the unit half of the argument-injection
+// fix (CWE-88). --base/--head values used to be copied into `git diff`'s argv verbatim, so a
+// value beginning with '-' stopped being a revision and became an option of git itself.
+func TestParseDiffFlagsRejectsOptionShapedRevision(t *testing.T) {
+	for _, args := range [][]string{
+		{"--base", "--output=/tmp/entire-graph-victim", "--head", "HEAD"},
+		{"--base", "HEAD~1", "--head", "--output=/tmp/entire-graph-victim"},
+		{"--base", "-"},
+		{"--head", ""},
+	} {
+		if _, _, err := parseDiffFlags(args); err == nil {
+			t.Errorf("parseDiffFlags(%q) accepted an option-shaped revision, want an error", args)
+		}
+	}
+	// Ordinary path-shaped refs with a single leading hyphen are valid Git revisions.
+	if _, _, err := parseDiffFlags([]string{"--base", "-foo", "--head", "HEAD"}); err != nil {
+		t.Errorf("parseDiffFlags([--base -foo --head HEAD]) = %v, want nil (-foo is a valid ref)", err)
+	}
+}
+
+// TestOptionShapedRevisionCannotWriteFiles is the end-to-end half. Before the fix,
+//
+//	entire graph diff --repo . --base '--output=FILE' --head HEAD
+//
+// exited 0 and left FILE truncated and replaced by git's own `-z --name-status` output,
+// because git parses options anywhere ahead of `--`. The `commit` verb had the same reach:
+// `git rev-parse '--output=FILE^'` does not fail, so FirstParent let the value through to the
+// same `git diff` argv. The revision here is an ordinary path with a '-' prefix, so nothing
+// about the fixture is platform-specific.
+func TestOptionShapedRevisionCannotWriteFiles(t *testing.T) {
+	repo := twoCommitRepo(t)
+	const secret = "victim contents that must survive\n"
+	victim := filepath.Join(t.TempDir(), "victim.txt")
+
+	tests := []struct {
+		name string
+		args func(target string) []string
+	}{
+		{"diff --base", func(target string) []string {
+			return []string{"diff", "--repo", repo, "--base", "--output=" + target, "--head", "HEAD"}
+		}},
+		{"diff --head", func(target string) []string {
+			return []string{"diff", "--repo", repo, "--base", "HEAD~1", "--head", "--output=" + target}
+		}},
+		{"analyze --base", func(target string) []string {
+			return []string{"analyze", "--repo", repo, "--base", "--output=" + target}
+		}},
+		{"commit revision", func(target string) []string {
+			return []string{"commit", "--repo", repo, "--output=" + target}
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(victim, []byte(secret), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var out, errOut bytes.Buffer
+			err := Run(t.Context(), Options{Stdout: &out, Stderr: &errOut, Version: "test-version"}, test.args(victim))
+			if err == nil {
+				t.Errorf("%s accepted an option-shaped revision; stdout:\n%s", test.name, out.String())
+			} else if !strings.Contains(err.Error(), "revision") {
+				t.Errorf("error %q does not explain that the value is not a revision", err)
+			}
+			got, readErr := os.ReadFile(victim)
+			if readErr != nil {
+				t.Fatalf("read victim file: %v", readErr)
+			}
+			if string(got) != secret {
+				t.Fatalf("%s let git rewrite a file outside the repository; victim now holds %q", test.name, string(got))
+			}
+		})
+	}
+}
+
+// TestDiffAcceptsOrdinaryRevisions is the over-rejection guard for the same fix: every shape
+// of revision a caller legitimately passes must still resolve.
+func TestDiffAcceptsOrdinaryRevisions(t *testing.T) {
+	repo := twoCommitRepo(t)
+	git(t, repo, "branch", "feature", "HEAD~1")
+	git(t, repo, "tag", "-a", "v1", "-m", "release", "HEAD~1")
+	full := rev(t, repo, "HEAD~1")
+
+	for _, base := range []string{"HEAD~1", "feature", "v1", full, full[:7]} {
+		var out, errOut bytes.Buffer
+		err := Run(t.Context(), Options{Stdout: &out, Stderr: &errOut, Version: "test-version"},
+			[]string{"diff", "--repo", repo, "--base", base, "--head", "HEAD", "--json"})
+		if err != nil {
+			t.Errorf("diff --base %q: %v\n%s", base, err, errOut.String())
+			continue
+		}
+		if !strings.Contains(out.String(), "\"files\"") {
+			t.Errorf("diff --base %q produced no result payload:\n%s", base, out.String())
+		}
+	}
+}
+
+// twoCommitRepo builds a git repository whose HEAD~1..HEAD range contains one real semantic
+// change, so a diff over it exercises the analysis rather than an empty file list.
+func twoCommitRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	// An explicit initial branch, not whatever the user's global
+	// init.defaultBranch names: this fixture creates a branch literally
+	// called "feature", and `git branch feature HEAD~1` fails with "a branch
+	// named 'feature' already exists" whenever init.defaultBranch=feature.
+	git(t, repo, "init", "-b", "twocommitrepo-trunk")
+	git(t, repo, "config", "user.name", "Entire Graph Test")
+	git(t, repo, "config", "user.email", "graph@example.com")
+	// A developer's global signing config would otherwise fail this fixture with
+	// "gpg failed to sign the data", the same class of global-config dependence
+	// as the init.defaultBranch collision above. Both keys are needed and they
+	// are independent: commit.gpgsign covers the two commits below, and
+	// tag.gpgSign covers the annotated tag TestDiffAcceptsOrdinaryRevisions
+	// creates in this repository ("git tag -a" signs under its own key, so
+	// pinning only commit.gpgsign still aborts with "unable to sign the tag").
+	git(t, repo, "config", "commit.gpgsign", "false")
+	git(t, repo, "config", "tag.gpgSign", "false")
+	write(t, repo, "a.go", "package main\n\nfunc validate() bool { return true }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "one")
+	write(t, repo, "a.go", "package main\n\nfunc validate() bool { return true }\n\nfunc audit() bool { return true }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "two")
+	return repo
+}
+
+// TestSnapshotRecordCacheCaptureIsMemoryBounded pins the streaming contract against the cache tee.
+//
+// resolveCacheDir falls back to the user cache directory, so useCache is true for every ordinary
+// committed snapshot/symbols/edges run: the tee that captures records for the cache is no longer the
+// opt-in it was written as, and an unbounded one makes a streaming command hold its entire output in
+// memory — proportional to the whole graph, on exactly the large repositories streaming exists for.
+//
+// The assertion is behavioural rather than a memory measurement: past the cap the run must still
+// produce its complete output, and must NOT store an entry (a stored entry is proof the whole stream
+// was buffered).
+func TestSnapshotRecordCacheCaptureIsMemoryBounded(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init")
+	git(t, repo, "config", "user.name", "Entire Graph Test")
+	git(t, repo, "config", "user.email", "graph@example.com")
+	write(t, repo, "main.go", "package sample\n\nfunc Caller() { Callee() }\nfunc Callee() {}\n")
+	git(t, repo, "add", "main.go")
+	git(t, repo, "commit", "-m", "initial")
+
+	run := func(cacheDir string) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := Run(t.Context(), Options{
+			Version: "bounded-capture-test",
+			Env:     EntireEnv{RepoRoot: repo},
+			Stdout:  &out,
+			Stderr:  io.Discard,
+		}, []string{"snapshot", "--repo", repo, "--format", "ndjson", "--cache-dir", cacheDir}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	cacheEntries := func(dir string) int {
+		t.Helper()
+		count := 0
+		if err := filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !entry.IsDir() {
+				count++
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	// CONTROL: with the real cap the run caches, which is what makes the bounded case meaningful.
+	roomy := t.TempDir()
+	full := run(roomy)
+	if cacheEntries(roomy) == 0 {
+		t.Fatal("the control run cached nothing, so this test proves nothing about the bound")
+	}
+
+	// BOUNDED: a cap smaller than this fixture's own output.
+	previous := providerRecordsCacheMaxBytes
+	providerRecordsCacheMaxBytes = 8
+	t.Cleanup(func() { providerRecordsCacheMaxBytes = previous })
+
+	tight := t.TempDir()
+	bounded := run(tight)
+	if bounded != full {
+		t.Fatalf("the bound changed the streamed output:\n got %q\nwant %q", bounded, full)
+	}
+	if entries := cacheEntries(tight); entries != 0 {
+		t.Fatalf("a %d-byte cap still stored %d cache entrie(s), so the whole stream was buffered",
+			providerRecordsCacheMaxBytes, entries)
 	}
 }

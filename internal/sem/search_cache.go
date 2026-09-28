@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,8 +20,14 @@ import (
 // "remove old version dirs" instead of per-entry reachability analysis.
 // v12 retires every entry produced before the final immutable-policy,
 // unconditional-worktree-bypass transaction checks, and shared nested-ignore
-// resource policy were complete.
-const searchSnapshotCacheVersion = "search-snapshot-v12"
+// resource policy were complete; v13 retires entries whose DATA_FLOWS records
+// carry a single evidence entry per edge rather than every flow; v14 retires
+// entries written before truncated records counted what they dropped; v15
+// retires the flat selective entries written before a derived snapshot was
+// nested beneath the complete entry it came from, which would otherwise sit
+// unreachable inside a live version directory and defeat that cleanup rule.
+// v16 retires the diagnostic-count status in favor of source-file health.
+const searchSnapshotCacheVersion = "search-snapshot-v16-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
@@ -61,6 +66,15 @@ type cachedSearchSnapshot struct {
 	// derivation reruns that resolution over cached symbols. Without it a cache
 	// hit would downgrade an overloaded call that a cold run resolves exactly.
 	BodylessSymbolIDs []string `json:"bodyless_symbol_ids,omitempty"`
+	// DerivedFrom is the generation of the complete entry this selective view was
+	// derived from, empty on a complete entry. Removing the derived directory
+	// cannot stop a derivation that read the OUTGOING complete snapshot before
+	// the rebuild published and then persisted after the removal: that artifact
+	// carries the tree and options the key already agrees with, so nothing else
+	// in this envelope separates it from a current one. Recording which INSTANCE
+	// it came from does, and the generation is read before the complete snapshot
+	// is, so such a writer necessarily stamps the generation being retired.
+	DerivedFrom string `json:"derived_from,omitempty"`
 }
 
 type cachedSignatureTypes struct {
@@ -95,33 +109,71 @@ func loadOrBuildSearchGraphSnapshot(
 	return loadOrBuildSearchSnapshot(ctx, repo, providerVersion, options, cacheDir, disableCache, nil)
 }
 
+// preloadedCompleteSnapshot is a complete snapshot already in memory together
+// with the cache generation that was current BEFORE it was read.
+//
+// The pair is what makes such a snapshot safe to derive from. A selective view
+// is stamped with the generation of the complete instance it came from, and
+// that is sound only while the generation is read FIRST: a reader that then
+// picks up the outgoing snapshot necessarily stamps the generation being
+// retired. A snapshot handed in from an earlier call inverts that order, so it
+// carries the generation it was read under and a consumer compares it against
+// the current one instead of assuming they agree.
+//
+// generationKnown distinguishes "the marker did not exist, which is the legacy
+// empty generation" from "the marker could not be read". Only the former is a
+// generation; the latter must not be compared with anything.
+type preloadedCompleteSnapshot struct {
+	snapshot        ProviderSnapshot
+	generation      string
+	generationKnown bool
+}
+
 func loadCachedCompleteSearchSnapshot(
 	ctx context.Context,
 	repo, providerVersion string,
 	options ProviderSnapshotOptions,
 	cacheDir string,
 ) (ProviderSnapshot, bool, error) {
+	preloaded, hit, err := loadCachedCompleteSearchSnapshotBinding(ctx, repo, providerVersion, options, cacheDir)
+	if err != nil || !hit {
+		return ProviderSnapshot{}, false, err
+	}
+	return preloaded.snapshot, true, nil
+}
+
+// loadCachedCompleteSearchSnapshotBinding is loadCachedCompleteSearchSnapshot
+// with the generation the snapshot was read under. An unreadable generation is
+// reported as unknown rather than as a failed load: a complete entry is not
+// derived from anything and stays perfectly usable for a complete query, and
+// only the selective derivation that needs a generation has to refuse it.
+func loadCachedCompleteSearchSnapshotBinding(
+	ctx context.Context,
+	repo, providerVersion string,
+	options ProviderSnapshotOptions,
+	cacheDir string,
+) (preloadedCompleteSnapshot, bool, error) {
 	if cacheDir == "" {
-		return ProviderSnapshot{}, false, nil
+		return preloadedCompleteSnapshot{}, false, nil
 	}
 	absRepo, err := filepath.Abs(repo)
 	if err != nil {
-		return ProviderSnapshot{}, false, err
+		return preloadedCompleteSnapshot{}, false, err
 	}
 	if !worktreeSnapshotCacheable(ctx, absRepo, options) {
-		return ProviderSnapshot{}, false, nil
+		return preloadedCompleteSnapshot{}, false, nil
 	}
 	capturedOptions, captureErr := ensureProviderCachePolicy(absRepo, options)
 	if captureErr != nil {
 		// Cache policy is stricter than sequential matcher construction because
 		// it retains every input at once. An optional cache must not make an
 		// otherwise valid query fail; let the caller continue to a cold build.
-		return ProviderSnapshot{}, false, nil
+		return preloadedCompleteSnapshot{}, false, nil
 	}
 	options = capturedOptions
 	commit, tree, headErr := resolveCommittedHEAD(ctx, absRepo)
 	if headErr != nil {
-		return ProviderSnapshot{}, false, nil
+		return preloadedCompleteSnapshot{}, false, nil
 	}
 	repositoryKey := repoKey(ctx, absRepo)
 	fullOptions := options
@@ -131,21 +183,31 @@ func loadCachedCompleteSearchSnapshot(
 	}
 	fullKey, keyErr := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, fullOptions)
 	if keyErr != nil {
-		return ProviderSnapshot{}, false, keyErr
+		return preloadedCompleteSnapshot{}, false, keyErr
 	}
+	// Read the generation BEFORE the snapshot, for the same reason the selective
+	// loader does: a reader that goes on to pick up the OUTGOING complete
+	// snapshot then carries the generation being retired, so the view derived
+	// from it later can be recognised as retired instead of being stamped with
+	// the incoming one and becoming permanently valid.
+	generation, generationErr := readCacheGeneration(cacheDir, "search", searchSnapshotCacheVersion, fullKey)
 	fullEntry, entryErr := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, fullKey)
 	if entryErr != nil {
-		return ProviderSnapshot{}, false, entryErr
+		return preloadedCompleteSnapshot{}, false, entryErr
 	}
 	cached, readErr := readSearchSnapshot(fullEntry)
 	if readErr != nil || !validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, fullOptions) {
-		return ProviderSnapshot{}, false, nil
+		return preloadedCompleteSnapshot{}, false, nil
 	}
 	// The cache key is tree-only: a hit may have been built for a different
 	// commit that shares this tree. The parsed graph is exactly correct, but
 	// commit provenance must reflect the HEAD we are serving right now.
 	cached = restampCachedSearchSnapshotCommit(cached, commit)
-	return cached.Snapshot, true, nil
+	return preloadedCompleteSnapshot{
+		snapshot:        cached.Snapshot,
+		generation:      generation,
+		generationKnown: generationErr == nil,
+	}, true, nil
 }
 
 // loadOrBuildSearchSnapshot is the single search-snapshot cache pipeline: it
@@ -161,7 +223,7 @@ func loadOrBuildSearchSnapshot(
 	options ProviderSnapshotOptions,
 	cacheDir string,
 	disableCache bool,
-	preloadedFull *ProviderSnapshot,
+	preloadedFull *preloadedCompleteSnapshot,
 ) (ProviderSnapshot, bool, error) {
 	if options.Profile == "" {
 		options.Profile = ProfileFull
@@ -194,15 +256,60 @@ func loadOrBuildSearchSnapshot(
 		return snapshot, false, buildErr
 	}
 	repositoryKey := repoKey(ctx, absRepo)
-	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options)
+	// A selective snapshot is DERIVED from the complete one for the same tree, so
+	// it is addressed beneath the complete entry rather than beside it. That is
+	// what lets a forced rebuild of the complete entry discard the views built
+	// from it; while they were flat siblings, `index --force` refreshed the
+	// complete entry and every selective query kept being served the entry it
+	// had asked to be rid of.
+	completeOptions := options
+	completeOptions.OnlyFiles = nil
+	completeKey, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, completeOptions)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
-	entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, key)
+	// Read the generation BEFORE any complete snapshot is: a derivation that goes
+	// on to read the outgoing snapshot then stamps the generation being retired,
+	// which is what makes a write that lands after the invalidation unservable
+	// rather than merely unlikely.
+	//
+	// It stamps DERIVED entries only. A complete entry is not derived from
+	// anything, is the artifact a rebuild replaces rather than discards, and is
+	// read by other entry points that know nothing about generations.
+	derivedFrom := ""
+	// generationKnown records whether the generation a derived entry must be
+	// compared against was actually read. Only a marker that does not exist yet
+	// means "no rebuild has retired anything"; a marker that could not be read
+	// means the answer is unknown, and the empty generation it would otherwise
+	// collapse to is the value every pre-`--force` derivation recorded. Serving
+	// or persisting a derived entry on an unknown generation therefore undoes the
+	// invalidation, so both are skipped and the query takes the build path.
+	generationKnown := true
+	key := completeKey
+	entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, completeKey)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
-	if cached, err := readSearchSnapshot(entry); err == nil && validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, options) {
+	if len(options.OnlyFiles) > 0 {
+		generation, generationErr := readCacheGeneration(cacheDir, "search", searchSnapshotCacheVersion, completeKey)
+		if generationErr != nil {
+			// Best effort, as everywhere on this query path: an optional cache
+			// that cannot be trusted becomes a miss, never a failed search.
+			generationKnown = false
+		}
+		derivedFrom = generation
+		key, err = searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options)
+		if err != nil {
+			return ProviderSnapshot{}, false, err
+		}
+		entry, err = newDerivedCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, completeKey, key)
+		if err != nil {
+			return ProviderSnapshot{}, false, err
+		}
+	}
+	if cached, err := readSearchSnapshot(entry); generationKnown && err == nil &&
+		validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, options) &&
+		cached.DerivedFrom == derivedFrom {
 		// See loadCachedCompleteSearchSnapshot: tree-only keying means this hit
 		// may belong to a different commit that shares the tree. Re-stamp before
 		// handing it back so no caller ever reports a stale commit.
@@ -229,25 +336,35 @@ func loadOrBuildSearchSnapshot(
 			}
 			// Persisting the exact selective view makes repeated identical queries
 			// a direct cache hit. As with ordinary search caching, this is best effort.
-			_ = writeSearchSnapshot(entry, newCachedSearchSnapshot(providerVersion, commit, tree, options, selective))
+			if generationKnown {
+				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective))
+			}
 			return selective, true
 		}
-		if preloadedFull != nil {
-			if selective, ok := deriveFromFull(*preloadedFull); ok {
+		// A preloaded complete snapshot was read by its caller BEFORE this
+		// function read the generation, which is the ordering the generation
+		// depends on, run backwards. A forced rebuild that published and bumped
+		// in between would otherwise let a view of the OUTGOING snapshot be
+		// stamped with the INCOMING generation and validate forever after -
+		// worse than the race the marker was added to close, because the
+		// invalidating removal has already happened by then.
+		//
+		// So the preload is used only while the generation it was read under is
+		// still the current one. When it is not, or when it was never known, the
+		// snapshot is discarded rather than trusted: the on-disk complete entry
+		// below is read AFTER the generation and can be stamped correctly, so
+		// falling through costs a decode and keeps the guarantee.
+		if generationKnown && preloadedFull != nil &&
+			preloadedFull.generationKnown && preloadedFull.generation == derivedFrom {
+			if selective, ok := deriveFromFull(preloadedFull.snapshot); ok {
 				return selective, true, nil
 			}
 		}
-		fullOptions := options
-		fullOptions.OnlyFiles = nil
-		fullKey, keyErr := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, fullOptions)
-		if keyErr != nil {
-			return ProviderSnapshot{}, false, keyErr
-		}
-		fullEntry, entryErr := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, fullKey)
+		fullEntry, entryErr := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, completeKey)
 		if entryErr != nil {
 			return ProviderSnapshot{}, false, entryErr
 		}
-		if cached, readErr := readSearchSnapshot(fullEntry); readErr == nil && validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, fullOptions) {
+		if cached, readErr := readSearchSnapshot(fullEntry); readErr == nil && validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, completeOptions) {
 			cached = restampCachedSearchSnapshotCommit(cached, commit)
 			if selective, ok := deriveFromFull(cached.Snapshot); ok {
 				return selective, true, nil
@@ -269,10 +386,12 @@ func loadOrBuildSearchSnapshot(
 	// returned snapshot reports the commit this call is serving, not whatever
 	// HEAD happened to be mid-build.
 	snapshot.Header.Commit = commit
-	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot)
+	cache := newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, snapshot)
 	// Cache persistence is best effort. Retrieval correctness never depends on
 	// a writable cache directory.
-	_ = writeSearchSnapshot(entry, cache)
+	if generationKnown {
+		_ = writeSearchSnapshot(entry, cache)
+	}
 	return snapshot, false, nil
 }
 
@@ -289,7 +408,7 @@ func loadOrDeriveSelectiveSearchSnapshot(
 	options ProviderSnapshotOptions,
 	cacheDir string,
 	disableCache bool,
-	full ProviderSnapshot,
+	full preloadedCompleteSnapshot,
 ) (ProviderSnapshot, bool, error) {
 	return loadOrBuildSearchSnapshot(ctx, repo, providerVersion, options, cacheDir, disableCache, &full)
 }
@@ -389,14 +508,39 @@ func preindexProviderSnapshotWithPersistenceReader(
 			return ProviderSnapshot{}, false, fmt.Errorf("persist preindex snapshot: %w", err)
 		}
 	}
+	if options.ForceRebuild {
+		// Refreshing the complete entry is not what --force promises. A selective
+		// search is served from its OWN entry before the complete one is ever
+		// consulted, so an entry that survives here keeps answering the query the
+		// rebuild was asked to correct — silently, and for as long as the tree is
+		// unchanged. Discarding the views derived from this entry is therefore
+		// part of the rebuild, not a cleanup, and a failure to do it is reported
+		// rather than swallowed: an invalidation that did not happen leaves the
+		// command claiming a rebuild it did not deliver.
+		//
+		// The order is what makes this a rule rather than a race. The fresh
+		// complete entry is published first, so a derivation that reads the
+		// generation minted next necessarily reads the NEW snapshot. Then the
+		// generation is bumped, which is the moment every artifact derived from
+		// the outgoing one stops being servable — including one whose write is
+		// still in flight and lands after the removal below, carrying the
+		// generation it read before any of this began. The removal is then only
+		// reclaiming the space that entries can no longer be served from.
+		if err := bumpCacheGeneration(cacheDir, "search", searchSnapshotCacheVersion, key); err != nil {
+			return ProviderSnapshot{}, false, fmt.Errorf("retire snapshots derived from the rebuilt preindex entry: %w", err)
+		}
+		if err := removeDerivedCacheEntries(cacheDir, "search", searchSnapshotCacheVersion, key); err != nil {
+			return ProviderSnapshot{}, false, fmt.Errorf("invalidate snapshots derived from the rebuilt preindex entry: %w", err)
+		}
+	}
 	return snapshot, cacheHit, nil
 }
 
 // validateBuiltSearchSnapshot closes the transaction between cache keying and
 // snapshot construction. Git tree identity alone is enough for source bytes,
-// but repository identity participates in stable symbol IDs, while provider
-// version and profile select the shape of the graph. A concurrent config or
-// option change must therefore fail before the snapshot is returned or stored.
+// but schema, repository identity, provider version, and profile select the
+// shape of the graph. A concurrent serializer, config, or option change must
+// therefore fail before the snapshot is returned or stored.
 // Commit is deliberately excluded: different commits with the same tree have
 // identical graph content and are re-stamped to the commit captured by the
 // caller after this validation succeeds.
@@ -406,22 +550,28 @@ func validateBuiltSearchSnapshot(
 	options ProviderSnapshotOptions,
 ) error {
 	header := snapshot.Header
-	if header.Tree != tree ||
+	if header.SchemaVersion != SchemaVersion ||
+		header.Tree != tree ||
 		header.RepoKey != repositoryKey ||
 		header.Provider != ProviderName ||
 		header.ProviderVersion != providerVersion ||
 		header.Profile != string(options.Profile) {
 		return fmt.Errorf(
-			"got repo %q tree %q provider %q version %q profile %q; want repo %q tree %q provider %q version %q profile %q",
-			header.RepoKey, header.Tree, header.Provider, header.ProviderVersion, header.Profile,
-			repositoryKey, tree, ProviderName, providerVersion, options.Profile,
+			"got schema %q repo %q tree %q provider %q version %q profile %q; want schema %q repo %q tree %q provider %q version %q profile %q",
+			header.SchemaVersion, header.RepoKey, header.Tree, header.Provider, header.ProviderVersion, header.Profile,
+			SchemaVersion, repositoryKey, tree, ProviderName, providerVersion, options.Profile,
 		)
 	}
 	return nil
 }
 
 func newCachedSearchSnapshot(providerVersion, commit, tree string, options ProviderSnapshotOptions, snapshot ProviderSnapshot) cachedSearchSnapshot {
+	return newCachedSearchSnapshotFrom(providerVersion, commit, tree, "", options, snapshot)
+}
+
+func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom string, options ProviderSnapshotOptions, snapshot ProviderSnapshot) cachedSearchSnapshot {
 	cache := cachedSearchSnapshot{
+		DerivedFrom:     derivedFrom,
 		CacheVersion:    searchSnapshotCacheVersion,
 		ProviderVersion: providerVersion,
 		Commit:          commit,
@@ -620,7 +770,7 @@ func selectiveSearchSnapshotFromFull(
 	if spec.name == ProfileSyntaxOnly {
 		emitStructuralRelationsCompact(sc.key, selective.Files, structuralByFile, emitRelation)
 	} else {
-		forEachRelation(sc.key, selective.Files, recordsByFile, sc.read, precomputedImports, spec, func() bool {
+		forEachRelation(ctx, sc.key, selective.Files, recordsByFile, sc.read, precomputedImports, spec, defaultProviderWorkerCount(), func() bool {
 			return ctx.Err() != nil
 		}, emitRelation, func(failure PartialFailure) {
 			relationFailures = append(relationFailures, failure)
@@ -688,23 +838,26 @@ func selectiveSearchSnapshotFromFull(
 	selective.Header.Warnings = warnings
 	selective.Header.PartialFailures = failures
 	selective.Header.Stats = ProviderStats{
-		Files:             len(selective.Files),
-		ParsedFiles:       parsedFiles,
-		Symbols:           len(selective.Symbols),
-		Relations:         len(selective.Relations),
-		PartialFailures:   len(failures),
-		CompletenessLevel: completenessLevel(completenessFailureCount(failures), len(selective.Files), parsedFiles, len(selective.Symbols)),
+		Files:           len(selective.Files),
+		ParsedFiles:     parsedFiles,
+		Symbols:         len(selective.Symbols),
+		Relations:       len(selective.Relations),
+		PartialFailures: len(failures),
 	}
 	selective.Header.Completeness = CompletenessReport{
 		Languages: completenessLanguages,
 		Relations: relationsByType,
+		Health:    calculateGraphHealth(selective.Files, failures, selective.Header.Stats),
 	}
+	selective.Header.Stats.CompletenessLevel = selective.Header.Completeness.Health.Status
 	return selective, nil
 }
 
 // The relation-phase failures recorded during selective derivation are merged
-// via mergePartialFailures (provider.go), skipping records the (filtered)
-// full-build failures already carry for the same file and code.
+// via mergePartialFailures (provider.go), which folds a record the (filtered)
+// full-build failures already carry for the same file and code into that record
+// instead of adding or dropping one — so the selective path reports the same
+// single record, carrying both phases' effects, that a full build does.
 func filterSearchPartialFailures(failures []PartialFailure, allowedFiles map[string]bool) []PartialFailure {
 	filtered := make([]PartialFailure, 0, len(failures))
 	for _, failure := range failures {
@@ -739,7 +892,22 @@ func LoadOrBuildProviderSnapshot(
 // can serve co-change edges computed against the prior history. That is
 // accepted because those edges are heuristic and confidence-scored, not
 // exact facts about the tree.
+// searchSnapshotKey addresses an entry for the schema THIS build serializes
+// under; searchSnapshotKeyForSchema carries the reasoning.
 func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions) (string, error) {
+	return searchSnapshotKeyForSchema(SchemaVersion, absRepo, repositoryKey, providerVersion, tree, options)
+}
+
+// searchSnapshotKeyForSchema takes the schema version explicitly so a test can
+// address the entry a build at another schema would have written. Production
+// reaches it only through searchSnapshotKey, which supplies SchemaVersion.
+//
+// The schema belongs in the ADDRESS and not only in the read-time check: two
+// builds at different schema versions otherwise share one artifact path, so each
+// one's store overwrites the other's and neither ever gets a warm cache. The
+// validity check catches the wrong answer; it cannot stop the mutual eviction
+// that produced it, because by then the entry has already been replaced.
+func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions) (string, error) {
 	if options.Worktree {
 		return "", errors.New("working-tree snapshots cannot have persistent cache keys")
 	}
@@ -749,6 +917,7 @@ func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, opt
 	}
 	hash := sha256.New()
 	writeCacheKeyString(hash, "cache-version", searchSnapshotCacheVersion)
+	writeCacheKeyString(hash, "schema-version", schemaVersion)
 	writeCacheKeyString(hash, "repository-path", absRepo)
 	writeCacheKeyString(hash, "repository-key", repositoryKey)
 	writeCacheKeyString(hash, "provider-version", providerVersion)
@@ -800,6 +969,12 @@ func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, opt
 // value back to a caller, so they have no re-stamping to do.
 func validCachedSearchSnapshot(cache cachedSearchSnapshot, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions) bool {
 	return cache.CacheVersion == searchSnapshotCacheVersion &&
+		// The stored header records the schema its records were serialized under, and
+		// nothing else here separates two schemas: searchSnapshotCacheVersion tracks
+		// the caching machinery, and providerVersion is the constant "dev" for every
+		// local build and "v0.0.0-ci" for every non-tag CI build. Without this clause
+		// a binary at schema N serves a snapshot built at schema N-1 as its own.
+		cache.Snapshot.Header.SchemaVersion == SchemaVersion &&
 		cache.ProviderVersion == providerVersion &&
 		cache.Tree == tree &&
 		cache.Profile == options.Profile &&
@@ -856,44 +1031,5 @@ func readSearchSnapshot(entry cacheEntry) (cachedSearchSnapshot, error) {
 }
 
 func writeSearchSnapshot(entry cacheEntry, cache cachedSearchSnapshot) error {
-	path := entry.writePath()
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(dir, ".snapshot-*.json.gz")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	removeTemporary := true
-	defer func() {
-		if removeTemporary {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	writer := gzip.NewWriter(temporary)
-	encoder := json.NewEncoder(writer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(cache); err != nil {
-		_ = writer.Close()
-		_ = temporary.Close()
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	removeTemporary = false
-	return nil
+	return entry.write("snapshot", cache)
 }

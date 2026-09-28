@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/entireio/entire-graph/internal/filedigest"
@@ -23,7 +24,18 @@ type ChangedFile struct {
 	Status  string `json:"status"`
 	Path    string `json:"path"`
 	OldPath string `json:"old_path,omitempty"`
+	// OldMode and NewMode are the Git tree entry modes for the base and head
+	// sides ("100644", "100755", "120000" for a symbolic link, "160000" for a
+	// gitlink, "000000" when that side does not exist). Callers need them
+	// because mode decides whether a blob is file content at all: a symlink is
+	// stored as a blob whose bytes are its target path, so nothing downstream
+	// can tell it apart from a one-line source file by content or name.
+	OldMode string `json:"old_mode,omitempty"`
+	NewMode string `json:"new_mode,omitempty"`
 }
+
+// SymlinkMode is the Git tree entry mode for a symbolic link.
+const SymlinkMode = "120000"
 
 type FileCochange struct {
 	Left  string
@@ -147,8 +159,270 @@ func FindCommitWithCheckpoint(ctx context.Context, repo, checkpointID string) (s
 	return commit, nil
 }
 
+// validateTreeish rejects a revision that cannot be passed to git as one.
+//
+// It refuses an empty string and an embedded NUL, and deliberately does NOT
+// refuse a leading '-'. A dash-prefixed ref is valid and resolvable -- `git
+// update-ref refs/heads/-evil` then `ls-tree --end-of-options -evil` lists that
+// tree -- so rejecting the shape would trade real refs for a risk
+// --end-of-options already removes. That is the trade this repository has made
+// wrongly before.
+func validateTreeish(rev string) error {
+	if rev == "" {
+		return errors.New("treeish is empty")
+	}
+	if strings.ContainsRune(rev, 0) {
+		return fmt.Errorf("invalid treeish %q: contains a NUL byte", rev)
+	}
+	return nil
+}
+
+// IndexNonRegularPaths returns the worktree paths whose INDEX mode is not a
+// regular file, keyed by slash-separated repo-relative path. Values are stage-0
+// object IDs, or empty for unmerged entries.
+//
+// lstat is not sufficient to answer this. With core.symlinks=false -- the
+// default wherever the filesystem cannot make symlinks, which is common on
+// Windows -- Git materializes a tracked mode-120000 entry as an ordinary file
+// whose contents are the link target. lstat then reports a regular file, and a
+// worktree listing that trusts it admits a symlink as source while the
+// committed listing excludes it by mode, so one repository yields two different
+// graphs on the same commit.
+//
+// Untracked paths have no index entry and are absent from the result, so a
+// caller still judges those by lstat alone.
+func IndexNonRegularPaths(ctx context.Context, repo string) (map[string]string, error) {
+	// Streamed through the same fixed count and byte bounds every other listing
+	// uses. Reading the index with run() buffered all of stdout and then
+	// strings.Split copied it again, so a repository near the 256 MiB raw-output
+	// limit the sibling listings enforce needed several more full-size copies
+	// here -- and could exhaust memory before any output was consumed -- while
+	// bypassing the bound that exists to stop exactly that.
+	paths := map[string]string{}
+	err := visitBoundedWorktreePathOutput(
+		newCmd(ctx, repo, "git", "ls-files", "-s", "-z"),
+		func(entry string) bool {
+			if entry == "" {
+				return true
+			}
+			// "<mode> SP <object> SP <stage> TAB <path>"
+			meta, path, found := strings.Cut(entry, "\t")
+			if !found || path == "" {
+				return true
+			}
+			mode, objectStage, found := strings.Cut(meta, " ")
+			if !found || isRegularTreeMode(mode) {
+				return true
+			}
+			objectID, stage, valid := strings.Cut(objectStage, " ")
+			if !valid {
+				return true
+			}
+			// Unmerged entries have no stage-0 object to compare.
+			if stage != "0" {
+				objectID = ""
+			}
+			paths[path] = objectID
+			return true
+		})
+	if err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+// maxSymlinkTargetBytes bounds what may be read as a symlink target. A target is a
+// PATH, and every platform this runs on caps a path far below this; the bound exists
+// because a mode-120000 index entry is not required by Git to hold one.
+const maxSymlinkTargetBytes = 4096
+
+// IndexReplacedNonRegularPaths returns the paths whose index entry is NOT a
+// regular file but whose worktree file no longer holds what that entry says,
+// keyed by slash-separated repo-relative path.
+//
+// It separates two states the index reports identically. With
+// core.symlinks=false Git writes a mode-120000 entry to disk as an ordinary file
+// containing the LINK TARGET, and that file is not an edit -- it is the symlink,
+// spelled the only way the filesystem allows. A user who deletes the link and
+// writes a real file in its place produces the same index mode and the same
+// lstat verdict, but different bytes.
+//
+// Content is what separates them, not modification status: Git reports the
+// materialized file as a typechange whenever core.symlinks is not persisted in
+// the repository's own config, so diff-files calls both cases modified and
+// cannot tell them apart.
+//
+// Only paths given in nonRegular are examined, so the cost is bounded by the
+// number of tracked symlinks and gitlinks rather than by the size of the tree.
+func IndexReplacedNonRegularPaths(ctx context.Context, repo string, nonRegular map[string]string) (map[string]struct{}, error) {
+	replaced := map[string]struct{}{}
+	var reader *BatchFileReader
+	defer func() {
+		if reader != nil {
+			_ = reader.Close()
+		}
+	}()
+	paths := make([]string, 0, len(nonRegular))
+	for path := range nonRegular {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		full := filepath.Join(repo, filepath.FromSlash(path))
+		info, err := os.Lstat(full)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect index path %q: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		objectID := nonRegular[path]
+		if objectID == "" || info.Size() > maxSymlinkTargetBytes {
+			replaced[path] = struct{}{}
+			continue
+		}
+		if reader == nil {
+			reader, err = NewBatchFileReader(ctx, repo, "HEAD")
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Read immutable OIDs from the bounded index listing. Path bytes never
+		// enter the line protocol, including newline and stage-like names. Consume
+		// and compare one bounded blob at a time instead of retaining every target.
+		indexed, comparable, err := reader.readIndexTarget(objectID)
+		if err != nil {
+			return nil, fmt.Errorf("read index path %q: %w", path, err)
+		}
+		if !comparable || info.Size() != int64(len(indexed)) {
+			replaced[path] = struct{}{}
+			continue
+		}
+		// The extra byte detects growth after Lstat even when the prefix matches.
+		current, err := readFileAtMost(full, len(indexed)+1)
+		if err != nil {
+			return nil, fmt.Errorf("read worktree index replacement %q: %w", path, err)
+		}
+		if string(current) != indexed {
+			replaced[path] = struct{}{}
+		}
+	}
+	if reader != nil {
+		if err := reader.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return replaced, nil
+}
+
+func (r *BatchFileReader) readIndexTarget(objectID string) (string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, kind, size, found, err := r.objectInfoLocked(objectID)
+	if err != nil {
+		return "", false, err
+	}
+	if !found {
+		return "", false, fmt.Errorf("index object %s is missing", objectID)
+	}
+	if kind != "blob" || size > maxSymlinkTargetBytes {
+		return "", false, nil
+	}
+	return r.readObjectContentsLocked(id, kind, size, objectID)
+}
+
+// readFileAtMost reads at most limit bytes, so a file that grew between the size
+// check and the read cannot widen the allocation.
+func readFileAtMost(name string, limit int) ([]byte, error) {
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	buffer := make([]byte, limit)
+	read, err := io.ReadFull(file, buffer)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return buffer[:read], nil
+}
+
+// ListRegularFiles lists the REGULAR files in a committed tree, excluding
+// symlinks and gitlinks.
+//
+// ListFiles cannot answer this, and not because it forgot a filter: it passes
+// --name-only, and a symlink is a blob, so no object-type test separates the
+// two. Only the mode does. A tracked symlink listed as a source file has its
+// TARGET PATH read as the blob's content and handed to a parser, so
+// `ln -s real.go link.go` makes a committed snapshot carry a file record whose
+// bytes are the string "real.go".
+//
+// The working-tree listing already refuses non-regular entries (see openSource's
+// worktree branch, which tests fs.ModeSymlink and IsRegular). This is the
+// committed-tree counterpart, so one repository stops giving two different
+// answers depending on --worktree.
+//
+// ListFiles is deliberately left alone: its other caller enumerates paths for
+// git log co-change, where a symlink costs nothing.
+func ListRegularFiles(ctx context.Context, repo, rev string) ([]string, error) {
+	if err := validateTreeish(rev); err != nil {
+		return nil, err
+	}
+	// --end-of-options so the revision can only be read as a revision. Git
+	// parses options anywhere ahead of it otherwise, and an option-shaped token
+	// such as "--help" would be obeyed rather than resolved -- yielding an empty
+	// listing at exit 0, which reads downstream as "this tree has no files".
+	out, err := run(ctx, repo, "git", "ls-tree", "-r", "-z", "--end-of-options", rev)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, entry := range strings.Split(out, "\x00") {
+		if entry == "" {
+			continue
+		}
+		// "<mode> SP <type> SP <object> TAB <path>". -z means the path is raw,
+		// never quoted, and a TAB cannot appear in the fields before it.
+		meta, path, found := strings.Cut(entry, "\t")
+		if !found || path == "" {
+			continue
+		}
+		mode, _, found := strings.Cut(meta, " ")
+		if !found {
+			continue
+		}
+		if !isRegularTreeMode(mode) {
+			continue
+		}
+		files = append(files, path)
+	}
+	return files, nil
+}
+
+// isRegularTreeMode reports whether a `git ls-tree` mode is a regular file:
+// 100644 or 100755. It excludes 120000 (symlink), 160000 (gitlink/submodule)
+// and 040000 (tree), testing the file-type bits rather than listing the two
+// permission spellings, so an unexpected mode is refused rather than admitted.
+func isRegularTreeMode(mode string) bool {
+	parsed, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return false
+	}
+	const (
+		typeMask = 0o170000
+		regular  = 0o100000
+	)
+	return parsed&typeMask == regular
+}
+
 func ListFiles(ctx context.Context, repo, rev string) ([]string, error) {
-	out, err := run(ctx, repo, "git", "ls-tree", "-r", "-z", "--name-only", rev)
+	if err := validateTreeish(rev); err != nil {
+		return nil, err
+	}
+	out, err := run(ctx, repo, "git", "ls-tree", "-r", "-z", "--name-only", "--end-of-options", rev)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +622,102 @@ func (b *ignoredDirectoryListingBudget) admit(field string) bool {
 // unusual paths from changing grep semantics.
 func GrepIndexMatches(ctx context.Context, repo string, patterns []string, maxPerFile int) ([]GrepMatch, error) {
 	return grepFixedStringMatches(ctx, repo, "", patterns, maxPerFile)
+}
+
+// GrepIndexPatternLines streams whole matching lines for caller-built,
+// case-sensitive POSIX expressions, returning only the first match per file.
+// Callers needing separate term evidence must scan each term independently.
+func GrepIndexPatternLines(ctx context.Context, repo string, patterns []string, visit func(GrepMatch) error) error {
+	return grepPatternLines(ctx, repo, "", patterns, 1, visit)
+}
+
+// GrepIndexPatternSample retains the legacy bounded sample for ordinary terms.
+func GrepIndexPatternSample(ctx context.Context, repo string, patterns []string, visit func(GrepMatch) error) error {
+	return grepPatternLines(ctx, repo, "", patterns, 32, visit)
+}
+
+// GrepTreePatternLines streams matches from the specified immutable tree and
+// strips Git's treeish prefix from each returned path.
+func GrepTreePatternLines(ctx context.Context, repo, treeish string, patterns []string, visit func(GrepMatch) error) error {
+	if treeish == "" || strings.HasPrefix(treeish, "-") || strings.ContainsRune(treeish, '\x00') {
+		return fmt.Errorf("invalid git grep treeish %q", treeish)
+	}
+	return grepPatternLines(ctx, repo, treeish, patterns, 1, visit)
+}
+
+func grepPatternLines(ctx context.Context, repo, treeish string, patterns []string, maxPerFile int, visit func(GrepMatch) error) error {
+
+	if len(patterns) == 0 {
+		return nil
+	}
+	args := []string{"grep", "--no-recurse-submodules", "--no-line-number", "--no-column", "--no-color", "--no-full-name", "-z", "-I", "-E", "-m", strconv.Itoa(maxPerFile), "-f", "-"}
+	if treeish != "" {
+		args = append(args, treeish)
+	}
+	args = append(args, "--")
+	cmd := newGitCmdWithCallerLocale(ctx, repo, args...)
+	// Pattern data can exceed Windows command-line limits; send it on stdin.
+	cmd.Stdin = strings.NewReader(strings.Join(patterns, "\n") + "\n")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err = cmd.Start(); err != nil {
+		return err
+	}
+	reader := bufio.NewReader(stdout)
+	readErr := readGrepPatternLines(reader, func(match GrepMatch) error {
+		if treeish != "" {
+			prefix := treeish + ":"
+			if !strings.HasPrefix(match.Path, prefix) {
+				return fmt.Errorf("git grep missing treeish prefix")
+			}
+			match.Path = strings.TrimPrefix(match.Path, prefix)
+		}
+		return visit(match)
+	})
+	if readErr != nil {
+		_ = cmd.Process.Kill()
+	}
+	waitErr := cmd.Wait()
+	if readErr != nil {
+		return readErr
+	}
+	if waitErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(waitErr, &exitError) && exitError.ExitCode() == 1 && stderr.Len() == 0 {
+			return nil
+		}
+		return fmt.Errorf("git grep pattern lines: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+	}
+	if stderr.Len() > 0 {
+		return fmt.Errorf("git grep pattern lines: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func readGrepPatternLines(reader *bufio.Reader, visit func(GrepMatch) error) error {
+	for {
+		path, err := reader.ReadString(0)
+		if err == io.EOF && path == "" {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("git grep path metadata: %w", err)
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if visitErr := visit(GrepMatch{Path: strings.TrimSuffix(path, "\x00"), Text: strings.TrimSuffix(line, "\n")}); visitErr != nil {
+			return visitErr
+		}
+		if err == io.EOF {
+			return nil
+		}
+	}
 }
 
 // GrepTreeMatches returns a bounded sample of matched fixed strings per file
@@ -600,10 +970,17 @@ func grepFixedStringMatches(ctx context.Context, repo, treeish string, patterns 
 	return matches, nil
 }
 
+// ChangedFiles lists the entries that differ between two tree-ish revisions.
+//
+// It asks for `--raw` rather than `--name-status` so each record carries the
+// base and head tree entry modes alongside the status. Mode is not decoration:
+// Git stores a symbolic link as a blob holding its target path, so without the
+// mode a caller that reads blob content sees `docs/real.py` as a one-line
+// Python file and has no way to know it is not source.
 func ChangedFiles(ctx context.Context, repo, base, head string, paths []string) ([]ChangedFile, error) {
 	args := []string{
 		"diff", "--no-relative", "--ignore-submodules=none",
-		"-z", "--name-status", "--find-renames", base, head, "--",
+		"-z", "--raw", "--find-renames", base, head, "--",
 	}
 	args = append(args, paths...)
 	out, err := run(ctx, repo, "git", args...)
@@ -614,20 +991,41 @@ func ChangedFiles(ctx context.Context, repo, base, head string, paths []string) 
 	var files []ChangedFile
 	fields := strings.Split(out, "\x00")
 	for i := 0; i < len(fields); {
-		status := fields[i]
+		metadata := fields[i]
 		i++
-		if status == "" {
+		if metadata == "" {
 			continue
 		}
+		// ":<oldmode> <newmode> <oldsha> <newsha> <status>" — one NUL-terminated
+		// field under -z, followed by one pathname (two for R/C).
+		if !strings.HasPrefix(metadata, ":") {
+			return nil, fmt.Errorf("git diff returned malformed raw metadata %q", metadata)
+		}
+		parts := strings.Fields(strings.TrimPrefix(metadata, ":"))
+		if len(parts) < 5 {
+			return nil, fmt.Errorf("git diff returned malformed raw metadata %q", metadata)
+		}
+		oldMode, newMode, status := parts[0], parts[1], parts[4]
 		switch {
 		case strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C"):
 			if i+1 < len(fields) {
-				files = append(files, ChangedFile{Status: status[:1], OldPath: fields[i], Path: fields[i+1]})
+				files = append(files, ChangedFile{
+					Status:  status[:1],
+					OldPath: fields[i],
+					Path:    fields[i+1],
+					OldMode: oldMode,
+					NewMode: newMode,
+				})
 				i += 2
 			}
 		default:
 			if i < len(fields) {
-				files = append(files, ChangedFile{Status: status[:1], Path: fields[i]})
+				files = append(files, ChangedFile{
+					Status:  status[:1],
+					Path:    fields[i],
+					OldMode: oldMode,
+					NewMode: newMode,
+				})
 				i++
 			}
 		}
@@ -1096,6 +1494,7 @@ type BatchFileReader struct {
 	closed         bool
 	poison         error
 	maxBytes       int64
+	skipOversize   bool
 	oversize       map[string]OversizeBlob
 	oversizeScan   func(path string, chunk []byte)
 	oversizePrefix func(path string) bool
@@ -1173,6 +1572,27 @@ func (r *BatchFileReader) SetMaxBytes(maxBytes int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.maxBytes = maxBytes
+}
+
+// SetSkipOversizeBodies makes an oversized blob be declined from its `info`
+// response, without ever asking Git for its contents.
+//
+// The size ceiling bounds what the reader HOLDS, not what it READS: an oversized
+// blob is still streamed past in full so its digest, line count and optional
+// prefix can be recorded. That is the right trade for the callers that consume
+// those records, and the wrong one for a caller that only wants source lines to
+// quote — for it the whole object is transferred and hashed only to be thrown
+// away, so one generated multi-gigabyte file in the tree turns a bounded
+// navigation answer into a multi-minute stall.
+//
+// With this set, an oversized path reports the same "no source" outcome it
+// reports today, and OversizeBlob records nothing for it: no digest is computed
+// because no body is requested. Callers that need those records must leave it
+// off. It is off by default, so no existing caller changes.
+func (r *BatchFileReader) SetSkipOversizeBodies(skip bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.skipOversize = skip
 }
 
 // OversizeBlob returns what ReadFile learned about a blob it refused to
@@ -1305,6 +1725,12 @@ func (r *BatchFileReader) readCheckedObjectSpec(objectSpec, oversizeKey string) 
 		// object after its header, so declining only after the request would still
 		// have to stream an arbitrarily large tree or commit merely to reach the next
 		// response. The info response has no object body to drain.
+		return "", false, nil
+	}
+	if r.skipOversize && r.maxBytes > 0 && objectSize > r.maxBytes {
+		// The info response already carries the size, so a caller that wants no
+		// digest for oversized blobs can decline here and never issue the
+		// contents request whose body would have to be drained in full.
 		return "", false, nil
 	}
 	// Pin the checked object before asking for content. Besides avoiding a second

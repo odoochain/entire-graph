@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -126,10 +127,10 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 		}
 	}
 	if len(rest) != 0 {
-		return unexpectedArgumentsError("search", opts.Version, rest)
+		return unexpectedArgumentsError("query", opts.Version, rest)
 	}
 	if strings.TrimSpace(flags.Query) == "" {
-		return errors.New("search requires --query")
+		return errors.New("query requires --query or a trailing query argument")
 	}
 	// ZERO-TOLL DELIVERY. When the caller has already computed this session's payload and handed it
 	// to the agent inside context the session pays for anyway, this call must cost nothing: echo
@@ -244,6 +245,13 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 							// The persisted state is local input, not a trusted rendering sink. A live
 							// text/agent response passes through termsafe; replay must preserve that
 							// terminal-safety boundary even if the session file was tampered with.
+							// termsafe.Writer, not the JSON-safe sink replaySearchPayload uses.
+							// searchFormatSupportsReplay admits only text and agent here, so the
+							// bytes below are terminal-bound prose: the full control rewrite is the
+							// correct one, and the C1-only JSON rewrite would let a raw ESC or DEL
+							// recorded by an older build through. The presearch sink is the opposite
+							// case -- an arbitrary file whose format this process never chose -- and
+							// takes the lossless JSON rewrite for that reason.
 							replayOut := termsafe.NewWriter(opts.Stdout)
 							if _, err := io.WriteString(replayOut, searchEchoHeader(flags.Query, state.Query)); err != nil {
 								return err
@@ -267,33 +275,40 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 		flags.MaxContextBytes = 0
 	}
 	response, err := sem.SearchRepository(ctx, repo, opts.Version, flags.Query, sem.SearchOptions{
-		Worktree:              flags.Worktree,
-		IgnoreFiles:           flags.IgnoreFiles,
-		IncludeFiles:          flags.IncludeFiles,
-		Profile:               profile,
-		TopK:                  flags.TopK,
-		ContextLines:          flags.ContextLines,
-		MaxRegionLines:        flags.MaxRegionLines,
-		MaxSnippetLines:       flags.MaxSnippetLines,
-		MaxRegionsPerFile:     flags.MaxRegionsPerFile,
-		CacheDir:              cacheDir,
-		DisableCache:          flags.DisableCache,
-		MaxIndexedFiles:       flags.MaxIndexedFiles,
-		IndexAllFiles:         flags.IndexAllFiles,
-		MaxContextBytes:       flags.MaxContextBytes,
-		BodyHeadRanks:         flags.BodyHeadRanks,
-		EnclosureContextLines: flags.EnclosureContextLines,
-		HeadWindowLines:       flags.HeadWindowLines,
-		FullUnitTop:           flags.FullUnitTop,
-		EditSiteBodies:        flags.EditSiteBodies,
-		CalleeHop:             flags.CalleeHop,
-		VerifyPrefix:          flags.VerifyPrefix,
-		VerifyPreFixStatus:    flags.VerifyPreFixStatus,
-		IncludeFileOutline:    flags.FileOutline,
-		VerifyExplainCommand:  flags.VerifyExplain,
-		Deep:                  flags.Deep,
-		SingleResolution:      flags.SingleResolution,
-		DocumentResolution:    flags.DocumentResolution,
+		Worktree:          flags.Worktree,
+		IgnoreFiles:       flags.IgnoreFiles,
+		IncludeFiles:      flags.IncludeFiles,
+		Profile:           profile,
+		TopK:              flags.TopK,
+		ContextLines:      flags.ContextLines,
+		MaxRegionLines:    flags.MaxRegionLines,
+		MaxSnippetLines:   flags.MaxSnippetLines,
+		MaxRegionsPerFile: flags.MaxRegionsPerFile,
+		CacheDir:          cacheDir,
+		DisableCache:      flags.DisableCache,
+		MaxIndexedFiles:   flags.MaxIndexedFiles,
+		IndexAllFiles:     flags.IndexAllFiles,
+		MaxContextBytes:   flags.MaxContextBytes,
+		// Only `--format text` renders the disclosure floor (writeTextSearch
+		// below); json, ndjson and agent carry the same exclusion facts as data —
+		// the W_REPO_IGNORED_SOURCE warning and the whole repo_ignored report —
+		// outside the context budget. Charging their ranking for a floor they
+		// never print bought them nothing and, at a tight ceiling, cost them
+		// their only ranked result.
+		OmitsRepoIgnoreDisclosureFloor: flags.Format != "text",
+		BodyHeadRanks:                  flags.BodyHeadRanks,
+		EnclosureContextLines:          flags.EnclosureContextLines,
+		HeadWindowLines:                flags.HeadWindowLines,
+		FullUnitTop:                    flags.FullUnitTop,
+		EditSiteBodies:                 flags.EditSiteBodies,
+		CalleeHop:                      flags.CalleeHop,
+		VerifyPrefix:                   flags.VerifyPrefix,
+		VerifyPreFixStatus:             flags.VerifyPreFixStatus,
+		IncludeFileOutline:             flags.FileOutline,
+		VerifyExplainCommand:           flags.VerifyExplain,
+		Deep:                           flags.Deep,
+		SingleResolution:               flags.SingleResolution,
+		DocumentResolution:             flags.DocumentResolution,
 
 		IncludeContainerMap:   flags.ContainerMap,
 		IncludeSignatureTypes: flags.SignatureTypes,
@@ -376,7 +391,7 @@ func searchSessionScopeFor(ctx context.Context, repo string) searchSessionScope 
 func writeSearchResponse(out io.Writer, response sem.SearchResponse, format string, contextBudget int) error {
 	switch format {
 	case "json":
-		encoder := json.NewEncoder(out)
+		encoder := json.NewEncoder(termsafe.NewJSONWriter(out))
 		encoder.SetEscapeHTML(false)
 		return encoder.Encode(response)
 	case "ndjson":
@@ -456,25 +471,87 @@ func echoPresearchPayload(out interface{ Write([]byte) (int, error) }, path stri
 	if len(payload) == 0 {
 		return fmt.Errorf("%s: %s is empty: a pre-delivered payload of zero bytes would answer the agent with nothing and still report success", envPresearch, path)
 	}
-	_, err = out.Write(payload)
-	return err
+	return replaySearchPayload(out, payload)
+}
+
+// replaySearchPayload is the sink every REPLAY of a stored search payload goes
+// through, and it exists because wrapping the encoders does not reach these bytes.
+//
+// The machine-format rule is applied where a value is ENCODED. A replay encodes
+// nothing: ENTIRE_GRAPH_PRESEARCH hands stdout a file another process wrote, and
+// the search echo hands it a payload a previous PROCESS wrote — possibly a
+// previous BUILD, one from before the rule existed. Those bytes carry whatever
+// that writer left in them, so the rule is applied again on the way out, exactly
+// as the warm provider-record cache in root.go re-applies it rather than trusting
+// the entry that produced it.
+//
+// It is JSONWriter and not Writer, for both replay paths, because the escape has
+// to be safe for a payload whose format this code does not know:
+//
+//   - JSONWriter's rewrite is lossless and leaves a machine format decodable —
+//     \u009d is the JSON escape for the same code point. Writer's is not usable
+//     here: it would rewrite DEL to \x7f, and DEL is a byte encoding/json leaves
+//     RAW inside a string, so a payload holding one would come out of a replay
+//     with an escape JSON does not define. Measured on Go 1.26.5,
+//     `{"p":"a\x7fb"}` through Writer no longer decodes, and through JSONWriter
+//     it does. Corrupting the document is a worse outcome than the byte, and
+//     0x7f introduces no sequence.
+//   - The text and agent renderers write through termsafe.Writer already, so a
+//     payload recorded in those formats arrives here with its C1 controls ALREADY
+//     in \u00XX form and every remaining byte below 0x80. JSONWriter leaves all of
+//     that untouched, which is what makes one wrapper correct for every format a
+//     payload can be in.
+//
+// The C1 range is the whole guarantee. A payload predating termsafe entirely
+// could hold a raw ESC, and JSONWriter does not rewrite it — a C0 escape inside a
+// JSON string would be an escape JSON does not define, the same way \x7f is.
+func replaySearchPayload(out io.Writer, payload []byte) error {
+	writer := termsafe.NewJSONWriter(out)
+	if _, err := writer.Write(payload); err != nil {
+		return err
+	}
+	// This is the one-shot case JSONWriter's own doc calls out: a caller that
+	// does not chunk its stream must still call Close, because a payload whose
+	// LAST byte happens to be a bare 0xc2 (an incomplete two-byte UTF-8 lead,
+	// not necessarily a C1 sequence at all) is withheld by Write pending a
+	// continuation byte that this replay's single Write call will never
+	// supply. Skipping Close silently drops that trailing byte from the
+	// replayed payload.
+	return writer.Close()
 }
 
 // writeNdjsonSearch streams a payload as one record per line: a header, the blocks that are their own
 // records, every ranked result, and a summary that carries the rest.
 func writeNdjsonSearch(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse) error {
 	{
-		encoder := json.NewEncoder(out)
+		encoder := json.NewEncoder(termsafe.NewJSONWriter(out))
 		encoder.SetEscapeHTML(false)
 		if err := encoder.Encode(map[string]any{
 			"record_type": "search_header",
-			"query":       response.Query,
-			"repo_root":   response.RepoRoot,
-			"commit":      response.Commit,
-			"tree":        response.Tree,
-			"profile":     response.Profile,
+			// The header record carries the envelope version for the same reason
+			// the JSON payload does: a consumer reading the stream must be able to
+			// branch on the shape before it parses a single result record.
+			"format_version": response.FormatVersion,
+			"query":          response.Query,
+			"repo_root":      response.RepoRoot,
+			"commit":         response.Commit,
+			"tree":           response.Tree,
+			"profile":        response.Profile,
 		}); err != nil {
 			return err
+		}
+		// The exclusion disclosure leads the stream, ahead of the results, because NDJSON is
+		// consumed a record at a time: a consumer that acts on the first usable result never
+		// reaches a trailing summary, and a disclosure it never reads reproduces exactly the
+		// blind spot this payload exists to close. It is REPEATED on the summary below, so a
+		// consumer that already parses `repo_ignored` there keeps working unchanged.
+		if response.RepoIgnored != nil {
+			if err := encoder.Encode(struct {
+				RecordType string `json:"record_type"`
+				*sem.RepoIgnoreReport
+			}{RecordType: "search_repo_ignored", RepoIgnoreReport: response.RepoIgnored}); err != nil {
+				return err
+			}
 		}
 		// The closed-set warning leads the stream for the same reason it leads the text output: it is
 		// the one record that changes what the patch has to contain.
@@ -523,6 +600,17 @@ func writeNdjsonSearch(out interface{ Write([]byte) (int, error) }, response sem
 		}
 		if response.CoverageNote != nil {
 			summary["coverage_note"] = response.CoverageNote
+		}
+		if response.RepoIgnored != nil {
+			summary["repo_ignored"] = response.RepoIgnored
+		}
+		// The signature-types block rides on the summary for the same reason the
+		// declaration card does. It was the one optional block with no serializer
+		// at all, so `--format ndjson --signature-types` charged the caller for
+		// the work, counted its bytes in the statistics, and then emitted a stream
+		// that did not contain it.
+		if len(response.SignatureTypes) > 0 {
+			summary["signature_types"] = response.SignatureTypes
 		}
 		return encoder.Encode(summary)
 	}
@@ -577,17 +665,127 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	// made once, here, rather than at the dozens of print sites in this function
 	// and in the sem renderers it calls.
 	out = termsafe.NewWriter(out)
+	// ORDER: the forgery notice first, the ignore disclosure second. Both blocks
+	// claim the head of the payload and both keep it -- the forgery notice says the
+	// bytes below may be lying about who wrote them, which a reader must know before
+	// reading any of them, while the disclosure only has to precede the RESULTS. The
+	// notice is a constant that carries no repository bytes, so it is outside the
+	// budget arithmetic the disclosure does below and cannot shrink it.
+	// The literal cluster is quarantined here, well before it is printed, so its verdict can feed
+	// the notice below. It is the one sem block that writes a repository body unprefixed and
+	// verbatim (search_literals.go, --edit-site-bodies), so it needs the same quarantine a ranked
+	// snippet gets. The rewrite is applied to the BODIES and the block is rendered from the result,
+	// not applied to the rendered bytes: see searchQuarantineLiteralCluster for why the renderer's
+	// own header cannot survive being re-classified from bytes alone.
+	quarantinedCluster, literalClusterForged := searchQuarantineLiteralCluster(response.LiteralCluster)
+	literalCluster := sem.RenderSearchLiteralCluster(quarantinedCluster)
+	// THE NOTICE IS DECIDED BY THE EXACT RENDERING PASS, without retaining that rendering. The
+	// dry pass follows the same diet and section decisions as the real pass and records only whether
+	// repository source that needed quarantine was selected. This keeps the notice exact while the
+	// real payload remains incremental even when the caller disables the context-byte limit.
+	//
+	// The notice says "some source lines quoted below", and the diet below means the response is
+	// not the payload: a ranked body past searchTextMaxFullBodies collapses to a locator and a
+	// related site prints as one line with no source at all. Asking the RESPONSE therefore warned
+	// about a line no reader could see, which is a false sentence and costs an honest repository
+	// the "pays nothing for it" property searchForgeryNotice is documented to have. It cannot be
+	// answered by predicting the diet either — a second copy of that decision is a copy that can
+	// disagree with the loop, and disagreeing in the other direction drops the notice off a body
+	// that IS printed. The rendered bytes are the one question no later step can outrun; it is the
+	// sink test writeAgentSearch already applies (searchPayloadDisclosesItsQuarantine), asked here
+	// in the other direction.
+	//
+	// The dry pass does not build a produced-line set or retain repository bytes; it records one bit.
+	sectionForged, err := writeTextSearchSections(io.Discard, response, literalCluster)
+	if err != nil {
+		return err
+	}
+	forged := literalClusterForged || sectionForged
+	// Ahead of everything, including the closed-set warning: it is the only block that says the
+	// payload's own bytes may be lying about who wrote them, and a reader who has already acted on
+	// a forged line will not come back for it.
+	if forged {
+		if _, err := out.Write(searchForgeryNotice); err != nil {
+			return err
+		}
+	}
+	// FIRST, ahead of every result: what the repository's own ignore rules took out
+	// of the corpus this answer came from. A reader who has already read the ranked
+	// hits has decided the answer is complete, so a disclosure printed after them is
+	// a disclosure nobody acts on.
+	//
+	// This block is repository-controlled (excluded path names, .gitignore/
+	// .graphignore file names, unreadable directory names) and is written here
+	// AHEAD of the ranked results that response.Stats.ResultBytes was already fit
+	// to response.Stats.ContextBudgetBytes for — so it is charged against that
+	// same ceiling rather than added on top of it. What a ceiling too small for it
+	// buys is a SHORTER disclosure, never a missing one (see the floor below); the
+	// JSON channel carries the full, uncapped report regardless
+	// (response.RepoIgnored).
+	if block := sem.RenderRepoIgnoreDisclosure(response.RepoIgnored); len(block) > 0 {
+		budget := response.Stats.ContextBudgetBytes
+		// Charged against the REMAINING headroom, not against the whole ceiling.
+		// The ranked results and the funded blocks were already fitted to this
+		// same budget, so asking only whether the disclosure fits ON ITS OWN
+		// admitted it on top of a payload already at the ceiling -- the rendered
+		// output then exceeded --max-context-bytes by the full block, which is
+		// repository-controlled and so attacker-sized.
+		//
+		// The three terms are the ones validateSearchContextBlockBudget funds
+		// from inside the ceiling (search_blocks.go); keep them in step.
+		funded := response.Stats.ResultBytes + response.Stats.TypeCardBytes + response.Stats.SignatureTypeBytes
+		// DEGRADE, NEVER OMIT. Charging the block against the headroom is right; going
+		// silent when that headroom is gone is not, and it failed in exactly the case
+		// this disclosure exists for. The fitter spends the ceiling down to the last few
+		// bytes (measured end to end: result_bytes 1993 of a 2000-byte ceiling, 3977 of
+		// 4000), so a repository with enough material to answer the query leaves no
+		// headroom — and `--format text` renders no warnings and no fallback marker of
+		// its own, so the ONLY signal that a committed rule removed content disappeared.
+		// The busy repository with many exclusions got the most complete-LOOKING answer.
+		//
+		// The full block still has to fit the headroom, because the repository sizes it.
+		// Under it sits an irreducible floor carrying no repository-controlled bytes at
+		// all — one sentence, one integer, a pointer at the JSON channel — and the floor
+		// is admitted against the CEILING rather than the headroom. That is the trade: a
+		// payload may exceed --max-context-bytes by at most the floor's documented bound,
+		// an amount this repository picks and a caller can budget for, rather than stay
+		// byte-exact by telling a reader a corpus was whole when it was not.
+		//
+		// A ceiling smaller than the floor itself prints nothing: the caller asked for
+		// less room than the shortest honest disclosure needs.
+		if budget > 0 && funded+len(block) > budget {
+			block = sem.RenderRepoIgnoreDisclosureFloor(response.RepoIgnored)
+			if len(block) > budget {
+				block = nil
+			}
+		}
+		if len(block) > 0 {
+			if _, err := out.Write(block); err != nil {
+				return err
+			}
+		}
+	}
 	if notice, _ := searchLowConfidenceNotices(response); len(notice) > 0 {
 		if _, err := out.Write(notice); err != nil {
 			return err
 		}
 	}
+	_, err = writeTextSearchSections(out, response, literalCluster)
+	return err
+}
+
+// writeTextSearchSections renders everything below the two leading notices, into a writer the
+// caller supplies rather than straight to the terminal sink. The split exists so the forgery
+// disclosure — which has to come FIRST — can be decided by the same control flow that prints the
+// sections while the actual payload is still written incrementally.
+func writeTextSearchSections(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse, literalCluster []byte) (bool, error) {
+	forged := false
 	// The closed-set warning precedes everything, including the map: it is the only block that
 	// changes what the patch has to CONTAIN, and a reader who has already written the edit will not
 	// come back for it.
 	if block := sem.RenderSearchClosedSet(response.ClosedSet); len(block) > 0 {
 		if _, err := out.Write(block); err != nil {
-			return err
+			return forged, err
 		}
 	}
 	// The map is printed before any body: it is what tells the reader whether the ranked
@@ -595,7 +793,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	// file will not scroll back for it.
 	if block := sem.RenderSearchContainerMap(response.ContainerMap, false); len(block) > 0 {
 		if _, err := out.Write(block); err != nil {
-			return err
+			return forged, err
 		}
 	}
 	primary, related, docs, tests := partitionSearchSections(response.Results)
@@ -629,6 +827,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	reanchorSlots := searchTextMaxFullBodies - searchTextOrdinaryBodyDemand(primary, demoteLowValue)
 	for _, result := range primary {
 		if demoteLowValue && searchLowValueBodyPath(result.FilePath) && !searchResultForcedByFlag(result) {
+			forged = forged || textSearchLocatorQuotesForgedBody(result)
 			writeTextSearchLocator(out, result)
 			continue
 		}
@@ -646,6 +845,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 		}
 		if full {
 			bodies++
+			forged = forged || textSearchResultQuotesForgedBody(result, true)
 			writeTextSearchResult(out, result, true)
 			continue
 		}
@@ -654,6 +854,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 		// silently neutralised the cap: on carbon-2752 all five hits still came back bodied. That
 		// re-check exists so the RANK TIER cannot throw away source the allocator paid for, and it is
 		// right for that job — but a cap the caller set is a decision, not an accident.
+		forged = forged || textSearchLocatorQuotesForgedBody(result)
 		writeTextSearchLocator(out, result)
 	}
 	// Contract context before the related and docs groups: it is about the hit the reader has
@@ -661,6 +862,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	if len(tests) > 0 {
 		fmt.Fprintf(out, "%s\n", searchTextTestHeader)
 		for _, result := range tests {
+			forged = forged || textSearchResultQuotesForgedBody(result, true)
 			writeTextSearchResult(out, result, true)
 		}
 		// Directly under the body it qualifies: "this is what the code must do" and "these are the
@@ -668,7 +870,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 		// body above will not scroll for the second half.
 		if block := sem.RenderSearchCoverageNote(response.CoverageNote); len(block) > 0 {
 			if _, err := out.Write(block); err != nil {
-				return err
+				return forged, err
 			}
 		}
 	}
@@ -676,16 +878,16 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	// command that proves it are one thought.
 	if block := sem.RenderSearchVerifyCommand(response.VerifyCommand); len(block) > 0 {
 		if _, err := out.Write(block); err != nil {
-			return err
+			return forged, err
 		}
 	}
 	if block := sem.RenderSearchFileOutline(response.FileOutlines); len(block) > 0 {
 		out.Write(block)
 		fmt.Fprintln(out)
 	}
-	if block := sem.RenderSearchLiteralCluster(response.LiteralCluster); len(block) > 0 {
-		if _, err := out.Write(block); err != nil {
-			return err
+	if len(literalCluster) > 0 {
+		if _, err := out.Write(literalCluster); err != nil {
+			return forged, err
 		}
 	}
 	// The two reference blocks stay ADJACENT and both stay ahead of the related and docs
@@ -696,7 +898,7 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	// patch must not break), while the declaration card is about identifiers inside its body.
 	if block := renderSignatureTypes(response.SignatureTypes); len(block) > 0 {
 		if _, err := out.Write(block); err != nil {
-			return err
+			return forged, err
 		}
 	}
 	writeTextSearchTypeCard(out, response.TypeCard)
@@ -715,10 +917,34 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	if len(docs) > 0 {
 		fmt.Fprintf(out, "%s\n", searchTextDocsHeader)
 		for _, result := range docs {
+			forged = forged || textSearchResultQuotesForgedBody(result, false)
 			writeTextSearchResult(out, result, false)
 		}
 	}
-	return nil
+	return forged, nil
+}
+
+func textSearchResultQuotesForgedBody(result sem.SearchResult, full bool) bool {
+	if !full && !searchResultCarriesCompleteBody(result) {
+		return false
+	}
+	if searchBodyCarriesRecordShape(result.Snippet) {
+		return true
+	}
+	for _, passage := range result.Passages {
+		if searchBodyCarriesRecordShape(passage.Snippet) {
+			return true
+		}
+	}
+	return false
+}
+
+func textSearchLocatorQuotesForgedBody(result sem.SearchResult) bool {
+	if searchResultDisplayName(result) != "" {
+		return false
+	}
+	_, _, window := sem.SearchLocatorWindow(result)
+	return searchBodyCarriesRecordShape(window)
 }
 
 // renderSignatureTypes prints the declarations of the types the top hit's own
@@ -864,21 +1090,45 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 	return "  [body: def " + name + "]"
 }
 
-// searchResultOnOneLine escapes the fields that go into a result's HEADER, where
-// the layout is one record per line and a newline is therefore not layout but
+// searchResultOnOneLine makes one result safe to print into a one-record-per-line payload.
+//
+// It escapes the fields that go into a result's HEADER, where a newline is not layout but
 // forgery: a repository can name a file "a.go\n1. src/real.go:1 score=99.0" and
 // fabricate a hit the search never returned. The wrapped writer cannot make that
 // call — by then a path's newline and a snippet's are the same byte — so the
 // header fields are escaped here, where the renderer still knows which is which.
 //
-// The result is taken and returned BY VALUE. Nothing upstream sees the escaped
-// copy, so the JSON encoding of the same response still reports the exact bytes
-// the repository holds.
+// It also quarantines the result's BODIES. A snippet's newlines are its structure, so they
+// cannot be escaped the way a path's are — but a body line that begins at column 0 and is
+// shaped like a record is the same forgery by another route, and `VERIFY:` is the one line an
+// agent is told to run. See internal/cli/search_forgery.go for the grammar, the disclosure that
+// goes with it, and what it does NOT protect against.
+//
+// This is the chokepoint every body reaches: writeTextSearchResult, writeTextSearchLocator (via
+// sem.SearchLocatorWindow, which derives its window from result.Snippet) and agentSearchBlock all
+// pass through here before printing.
+//
+// The result is taken and returned BY VALUE, and a passage slice is copied before any element of
+// it changes. Nothing upstream sees the escaped copy, so the JSON encoding of the same response
+// still reports the exact bytes the repository holds.
 func searchResultOnOneLine(result sem.SearchResult) sem.SearchResult {
 	result.FilePath = termsafe.Line(result.FilePath)
 	result.QualifiedName = termsafe.Line(result.QualifiedName)
 	result.SymbolName = termsafe.Line(result.SymbolName)
 	result.Kind = termsafe.Line(result.Kind)
+	result.Snippet, _ = searchQuarantineBody(result.Snippet)
+	for index, passage := range result.Passages {
+		quarantined, changed := searchQuarantineBody(passage.Snippet)
+		if !changed {
+			continue
+		}
+		// Copy before writing: result.Passages still aliases the caller's backing array, and the
+		// by-value contract above is what keeps the JSON encoding of this response honest.
+		passages := make([]sem.SearchPassage, len(result.Passages))
+		copy(passages, result.Passages)
+		passages[index].Snippet = quarantined
+		result.Passages = passages
+	}
 	return result
 }
 
@@ -1205,6 +1455,14 @@ func agentSearchSectionTag(result sem.SearchResult) string {
 	return ""
 }
 
+// agentSearchPrefixHead pairs the two outermost prefix blocks so the fitter can walk them as one
+// flat list. See the comment at its only construction site in writeAgentSearch for the ordering
+// the pairing encodes.
+type agentSearchPrefixHead struct {
+	notice []byte
+	header []byte
+}
+
 func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse, budget int) error {
 	// Same sink class as the text renderer, and the format agents are told to
 	// prefer — so it gets the same guard. See writeTextSearch.
@@ -1223,11 +1481,20 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 		stats.PreselectLatencyMS,
 		stats.TotalLatencyMS,
 	))
-	fullDiagnostics, compactDiagnostics := agentSearchDiagnostics(response)
-	fullConfidence, compactConfidence := searchLowConfidenceNotices(response)
-	fullMap := sem.RenderSearchContainerMap(response.ContainerMap, false)
-	compactMap := sem.RenderSearchContainerMap(response.ContainerMap, true)
-	closedSet := sem.RenderSearchClosedSet(response.ClosedSet)
+	// EVERY block below is measured against the caller's byte cap, so every block
+	// is escaped BEFORE it is measured. The terminal-safety rewrite turns one ESC
+	// into four printed bytes and one C1 byte into six, so fitting the raw bytes
+	// and escaping them on the way out let a snippet carrying control bytes hand
+	// an agent several times the output it asked for — --max-context-bytes is a
+	// hard ceiling, not an estimate. Escaping is idempotent (its output is
+	// printable ASCII plus the layout bytes it keeps) and distributes over the
+	// concatenations below, so the writer wrap stays as defence in depth and the
+	// arithmetic here is now the arithmetic of what is actually written.
+	fullDiagnostics, compactDiagnostics := agentSearchSafeBlockPair(agentSearchDiagnostics(response))
+	fullConfidence, compactConfidence := agentSearchSafeBlockPair(searchLowConfidenceNotices(response))
+	fullMap := termsafe.Bytes(sem.RenderSearchContainerMap(response.ContainerMap, false))
+	compactMap := termsafe.Bytes(sem.RenderSearchContainerMap(response.ContainerMap, true))
+	closedSet := termsafe.Bytes(sem.RenderSearchClosedSet(response.ClosedSet))
 	// Suffix blocks in priority order. VERIFY comes first because it is the one an agent acts on
 	// immediately; the literal cluster next because it can end the search; the declaration card last
 	// because it is pure reference and is off by default anyway.
@@ -1236,7 +1503,7 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 	// (sessions without one spent 15.2% fewer tokens than the baseline against 30.6% with one), and it
 	// is two lines. It is prepended to the RANKING instead, where the byte fitter cannot silently drop
 	// it — see fitAgentSearchSuffixes for why the rest stay surplus.
-	verifyBlock := sem.RenderSearchVerifyCommand(response.VerifyCommand)
+	verifyBlock := termsafe.Bytes(sem.RenderSearchVerifyCommand(response.VerifyCommand))
 	// VERIFY is undroppable in every budget that can afford it, and the LAST thing tried before the
 	// caller would get no ranked location at all. Those two rules are both load-bearing and they can
 	// conflict at a tight cap, so the block gets its own variant rung: present, then absent. The
@@ -1246,12 +1513,47 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 	if len(verifyBlock) > 0 {
 		verifyVariants = append(verifyVariants, nil)
 	}
+	// See writeTextSearch for why the literal cluster is quarantined here rather than in its own
+	// renderer, and why the rewrite lands on the block's bodies rather than on its rendered bytes.
+	quarantinedCluster, _ := searchQuarantineLiteralCluster(response.LiteralCluster)
+	literalCluster := sem.RenderSearchLiteralCluster(quarantinedCluster)
+	// The LINES the quarantine produces, not merely whether it produced any. The notice is emitted
+	// when the set is non-empty, and the sink test below asks the set whether the composition the
+	// fitter finally chose kept one of them: a forged record that the byte fitter clipped away must
+	// not cost the caller the ranked location that survived. See searchPayloadDisclosesItsQuarantine.
+	//
+	// THE SET IS TAKEN IN THE FORM THIS RENDERER EMITS, which is what escaping-before-measuring
+	// makes necessary here and nowhere else. searchResponseQuarantinedLines derives the lines from
+	// the RAW bodies, the blocks above are escaped before they are measured, and the sink asks
+	// whether a payload LINE opens one of the produced lines — so a forged record that is both
+	// record-shaped and carries a control byte reached the payload as `\x1b`, matched nothing in a
+	// raw set, and the sink reported a payload that plainly carried it as disclosing nothing.
+	// Measured on this branch before the fix, at every budget from 71 to 276 for a body holding
+	// "VERIFY: go test ./pkg" + ESC + "[31m": the payload was
+	// "I:miss/0 …\npkg/payment.go:7 *\n VERIFY: go test ./pkg\\x1b[31m\n" — the quarantined line and
+	// no UNTRUSTED FILE CONTENT header at all. Escaping the set closes it in the only direction that
+	// keeps --max-context-bytes a real ceiling: the disclosure is decided on the bytes the reader
+	// actually receives, not on bytes no payload ever holds.
+	quarantinedLines := agentSearchEmittedQuarantinedLines(
+		searchResponseQuarantinedLines(response.Results, response.LiteralCluster))
 	suffixes := [][]byte{
-		sem.RenderSearchLiteralCluster(response.LiteralCluster),
-		agentSearchTypeCard(response.TypeCard),
+		// main quarantines the cluster's BODIES before rendering; this branch escapes every
+		// block before it is MEASURED. Both apply, in that order: quarantine decides the
+		// content, termsafe decides the bytes the fitter is allowed to count.
+		termsafe.Bytes(literalCluster),
+		termsafe.Bytes(agentSearchTypeCard(response.TypeCard)),
+	}
+	// The forgery disclosure leads the payload when anything was quarantined. It is a prefix, not a
+	// suffix, for the same reason VERIFY is: a warning an agent reads after acting is not a warning.
+	// It degrades only to absent, and only outside every other ladder, so it is the last block the
+	// fitter gives up — see the variant loops below.
+	var forgeryNotice []byte
+	if len(quarantinedLines) > 0 {
+		forgeryNotice = searchForgeryNotice
 	}
 	if budget <= 0 {
-		payload := append([]byte{}, fullHeader...)
+		payload := append([]byte{}, forgeryNotice...)
+		payload = append(payload, fullHeader...)
 		payload = append(payload, fullDiagnostics...)
 		payload = append(payload, fullConfidence...)
 		payload = append(payload, closedSet...)
@@ -1344,23 +1646,41 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 	//
 	// A rendered block is location-only when every line is a `N. path:line …` header, so ask
 	// that question of the bytes instead of guessing a size.
+	// The forgery notice and the header ladder are FLATTENED into one list of prefix heads rather
+	// than nested, because the ladder is already six loops deep and a seventh would reindent all of
+	// it for one block. The pairing order is what the nesting would have expressed: the notice
+	// varies SLOWEST, so every header rung is tried with the notice present before any rung is
+	// tried without it, which makes the notice the last prefix block the fitter gives up. A rung
+	// without it is offered only when there is a notice at all, so an honest payload adds none.
+	headers := [][]byte{fullHeader, compactHeader, timedHeader, terseHeader, legacyHeader}
+	heads := make([]agentSearchPrefixHead, 0, 2*len(headers))
+	for _, header := range headers {
+		heads = append(heads, agentSearchPrefixHead{notice: forgeryNotice, header: header})
+	}
+	if len(forgeryNotice) > 0 {
+		for _, header := range headers {
+			heads = append(heads, agentSearchPrefixHead{header: header})
+		}
+	}
 	for _, protectTopHit := range []bool{true, false} {
 		if protectTopHit && len(results) == 0 {
 			continue // nothing to protect; the fallback pass is the only pass
 		}
-		for _, header := range [][]byte{fullHeader, compactHeader, timedHeader, terseHeader, legacyHeader} {
+		for _, head := range heads {
+			forgery, header := head.notice, head.header
 			for _, diagnostics := range diagnosticVariants {
 				for _, confidence := range confidenceVariants {
 					for _, warning := range closedSetVariants {
 						for _, containerMap := range mapVariants {
 							for _, verify := range verifyVariants {
-								remaining := budget - len(header) - len(diagnostics) - len(confidence) -
+								remaining := budget - len(forgery) - len(header) - len(diagnostics) - len(confidence) -
 									len(warning) - len(containerMap) - len(verify)
 								if remaining <= 0 {
 									continue
 								}
 								prefix := func() []byte {
-									payload := append([]byte{}, header...)
+									payload := append([]byte{}, forgery...)
+									payload = append(payload, header...)
 									payload = append(payload, diagnostics...)
 									payload = append(payload, confidence...)
 									payload = append(payload, warning...)
@@ -1379,9 +1699,17 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 								if len(results) == 0 {
 									noResults := []byte("No search results.\n")
 									if len(noResults) <= remaining {
-										_, err := out.Write(fitAgentSearchSuffixes(
+										payload := fitAgentSearchSuffixes(
 											append(prefix(), noResults...), agentVerifyFirstSuffixes(verify, verifyBlock, suffixes), budget,
-										))
+										)
+										// A result-less plan can still carry quarantined source: the literal
+										// cluster is a suffix and its renderer quarantines it. The produced
+										// lines are passed in because the bytes alone cannot tell a line this
+										// renderer indented from one the file already held indented.
+										if !searchPayloadDisclosesItsQuarantine(string(payload), quarantinedLines) {
+											continue
+										}
+										_, err := out.Write(payload)
 										return err
 									}
 									continue
@@ -1394,9 +1722,28 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 									continue
 								}
 								if len(formatted) > 0 {
-									_, err := out.Write(fitAgentSearchSuffixes(
+									payload := fitAgentSearchSuffixes(
 										append(prefix(), formatted...), agentVerifyFirstSuffixes(verify, verifyBlock, suffixes), budget,
-									))
+									)
+									// THE NOTICE IS NOT DROPPABLE WHILE THE INDENT IT EXPLAINS SURVIVES.
+									// The notice-free rungs above exist so a tight cap can still buy a
+									// ranked location; they are legitimate only for a plan whose FITTED
+									// bytes hold no quarantined line. Rejecting the plan here rather than
+									// deleting those rungs keeps the ranking at the caps where the fitter
+									// clipped the forged line away, and costs the ladder nothing it was
+									// entitled to: the next rung down is tried immediately.
+									//
+									// The test asks for the LINES this response quarantined, because a
+									// one-space-indented record shape in the bytes is equally what an
+									// honest file looks like when it holds one. Asked only for a shape, it
+									// rejected every rung of a notice-free ladder over an honest indented
+									// line and lost the caller its whole payload — both when nothing was
+									// quarantined at all and when the forged result was clipped away and
+									// an honest one survived.
+									if !searchPayloadDisclosesItsQuarantine(string(payload), quarantinedLines) {
+										continue
+									}
+									_, err := out.Write(payload)
 									return err
 								}
 							}
@@ -1416,11 +1763,41 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 		if len(response.PartialFailures) > 0 {
 			marker = "!D"
 		}
-		combined := []byte(fmt.Sprintf("Index: cache-%s%s\n", cacheState, marker))
-		if len(combined) <= budget {
-			payload = combined
-		} else {
-			payload = []byte(fmt.Sprintf("%s I:%s\n", marker, cacheState))
+		// The exclusion count degrades WITH the marker rather than being dropped
+		// alongside it. This rung synthesizes its own text, so building it from the
+		// marker alone silently discarded the X suffix agentSearchDiagnostics had
+		// already decided was not droppable telemetry — a payload too small for a
+		// ranked location would go back to implying it saw the whole repository. The
+		// rungs are ordered so the count survives wherever it fits at all: the
+		// shorter form that carries it beats the longer one that does not.
+		excluded := ""
+		if response.Stats.RepoIgnoredFiles > 0 {
+			excluded = fmt.Sprintf(" X%d", response.Stats.RepoIgnoredFiles)
+		}
+		candidates := [][]byte{
+			[]byte(fmt.Sprintf("Index: cache-%s%s%s\n", cacheState, marker, excluded)),
+			[]byte(fmt.Sprintf("%s I:%s%s\n", marker, cacheState, excluded)),
+		}
+		if excluded != "" {
+			// The count outlives the cache state, not the other way round. Below the
+			// bytes the pair needs, every remaining rung named the cache state and
+			// dropped the count — so the tightest budgets, which cannot hold a ranked
+			// location either, went back to implying the answer saw the whole
+			// repository. A stale-index marker is telemetry the caller can re-derive
+			// by asking again; a corpus the repository narrowed is not. This rung is
+			// only ever reached when the fuller line does not fit, so no budget that
+			// can afford both is made to choose.
+			candidates = append(candidates, []byte(fmt.Sprintf("%s%s\n", marker, excluded)))
+		}
+		candidates = append(candidates,
+			[]byte(fmt.Sprintf("Index: cache-%s%s\n", cacheState, marker)),
+			[]byte(fmt.Sprintf("%s I:%s\n", marker, cacheState)),
+		)
+		for _, candidate := range candidates {
+			payload = candidate
+			if len(candidate) <= budget {
+				break
+			}
 		}
 	}
 	if len(payload) > budget {
@@ -1515,7 +1892,8 @@ func agentSearchTypeCard(card []sem.TypeCardEntry) []byte {
 }
 
 func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
-	if len(response.Warnings) == 0 && len(response.PartialFailures) == 0 {
+	if len(response.Warnings) == 0 && len(response.PartialFailures) == 0 &&
+		response.Stats.RepoIgnoredFiles == 0 {
 		return nil, nil
 	}
 	languages, files := searchCompletenessCounts(response.Completeness)
@@ -1524,19 +1902,36 @@ func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
 		level = "degraded"
 	}
 	var full bytes.Buffer
-	fmt.Fprintf(&full, "Coverage: %s (%d language%s/%d file%s; %d warning%s; %d partial failure%s)\n",
+	// The excluded count sits inside the file count's own parentheses on purpose.
+	// This line is the payload's claim about how much of the repository the answer
+	// saw; printing "2 files" beside a silently removed third is what let one
+	// committed ignore line narrow a reader's field of view unannounced.
+	fmt.Fprintf(&full, "Coverage: %s (%d language%s/%d file%s%s; %d warning%s; %d partial failure%s)\n",
 		level, languages, pluralSuffix(languages), files, pluralSuffix(files),
+		agentCoverageExcluded(response.Stats.RepoIgnoredFiles),
 		len(response.Warnings), pluralSuffix(len(response.Warnings)),
 		len(response.PartialFailures), pluralSuffix(len(response.PartialFailures)),
 	)
 	const maxAgentDiagnostics = 3
+	// The exclusion disclosure is hoisted into a visible slot before the cap is
+	// applied. It is the only warning whose whole value is the path it names, and
+	// the omitted-diagnostics line replaces that path with a count — "something is
+	// hidden" instead of "internal/auth/auth.go is hidden". Producers put it first
+	// already; hoisting here means no future producer ordering can lose it.
+	warnings := hoistRepoIgnoreDisclosure(response.Warnings)
+	// The same argument on the failure side. The exclusion SHORTFALL is what turns
+	// the coverage line's file count — and the compact form's X<n> — from a fact
+	// into a lower bound, and producers append it after whatever parser failures
+	// the run collected. Three unparseable files were enough to push it past the
+	// cap, leaving a payload that reported a narrowed corpus as if it were whole.
+	failures := hoistRepoIgnoreShortfall(response.PartialFailures)
 	warningsVisible, failuresVisible := agentDiagnosticVisibility(
-		len(response.Warnings), len(response.PartialFailures), maxAgentDiagnostics,
+		len(warnings), len(failures), repoIgnoreShortfallCount(failures), maxAgentDiagnostics,
 	)
-	for _, warning := range response.Warnings[:warningsVisible] {
+	for _, warning := range warnings[:warningsVisible] {
 		fmt.Fprintf(&full, "- warning %s%s\n", warning.Code, agentDiagnosticPath(warning.FilePath))
 	}
-	for _, failure := range response.PartialFailures[:failuresVisible] {
+	for _, failure := range failures[:failuresVisible] {
 		fmt.Fprintf(&full, "- partial %s%s\n", failure.Code, agentDiagnosticPath(failure.FilePath))
 	}
 	visible := warningsVisible + failuresVisible
@@ -1547,20 +1942,119 @@ func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
 	if level == "degraded" {
 		marker = "D"
 	}
-	compact := []byte(fmt.Sprintf("!%s W%d F%d L%d/%d\n",
-		marker, len(response.Warnings), len(response.PartialFailures), languages, files))
+	excluded := ""
+	if response.Stats.RepoIgnoredFiles > 0 {
+		// X is not droppable telemetry: the compact form exists for tight budgets,
+		// and a budget too small for the count is not a reason to let the payload
+		// go back to implying it saw the whole repository.
+		excluded = fmt.Sprintf(" X%d", response.Stats.RepoIgnoredFiles)
+	}
+	compact := []byte(fmt.Sprintf("!%s W%d F%d L%d/%d%s\n",
+		marker, len(response.Warnings), len(response.PartialFailures), languages, files, excluded))
 	return full.Bytes(), compact
 }
 
-func agentDiagnosticVisibility(warnings, failures, limit int) (int, int) {
+// repoIgnoreDisclosureWarning is the code of the warning that names a file the
+// repository's own ignore rules removed from the corpus.
+const repoIgnoreDisclosureWarning = "W_REPO_IGNORED_SOURCE"
+
+// hoistRepoIgnoreDisclosure returns warnings with the exclusion disclosure moved
+// to the front, leaving every other warning in its original order. The input is
+// never mutated.
+func hoistRepoIgnoreDisclosure(warnings []sem.ProviderWarning) []sem.ProviderWarning {
+	index := -1
+	for i, warning := range warnings {
+		if warning.Code == repoIgnoreDisclosureWarning {
+			index = i
+			break
+		}
+	}
+	if index <= 0 {
+		return warnings
+	}
+	hoisted := make([]sem.ProviderWarning, 0, len(warnings))
+	hoisted = append(hoisted, warnings[index])
+	hoisted = append(hoisted, warnings[:index]...)
+	return append(hoisted, warnings[index+1:]...)
+}
+
+// repoIgnoreShortfallPrefix is the code prefix every partial failure that
+// qualifies the exclusion accounting shares (E_REPO_IGNORE_UNREADABLE,
+// E_REPO_IGNORE_COUNT_INCOMPLETE, E_REPO_IGNORE_GIT_UNAVAILABLE).
+//
+// A prefix rather than a list on purpose: the producer and this renderer are in
+// different packages, and a list here would have to be edited every time the
+// producer learns a new way for the count to fall short. A prefix makes the next
+// one visible by construction instead of silently capped away.
+const repoIgnoreShortfallPrefix = "E_REPO_IGNORE_"
+
+// repoIgnoreShortfallCount reports how many failures qualify the exclusion
+// accounting (see repoIgnoreShortfallPrefix). Shared by hoistRepoIgnoreShortfall
+// and agentDiagnosticVisibility so the two agree on exactly what counts as one
+// of these failures.
+func repoIgnoreShortfallCount(failures []sem.PartialFailure) int {
+	count := 0
+	for _, failure := range failures {
+		if strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			count++
+		}
+	}
+	return count
+}
+
+// hoistRepoIgnoreShortfall returns failures with every exclusion-shortfall
+// record moved to the front, each group keeping its original relative order.
+// The input is never mutated.
+func hoistRepoIgnoreShortfall(failures []sem.PartialFailure) []sem.PartialFailure {
+	shortfalls := repoIgnoreShortfallCount(failures)
+	if shortfalls == 0 || shortfalls == len(failures) {
+		return failures
+	}
+	hoisted := make([]sem.PartialFailure, 0, len(failures))
+	for _, failure := range failures {
+		if strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			hoisted = append(hoisted, failure)
+		}
+	}
+	for _, failure := range failures {
+		if !strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			hoisted = append(hoisted, failure)
+		}
+	}
+	return hoisted
+}
+
+// agentCoverageExcluded renders the repository-controlled exclusion count inside
+// the coverage line, or nothing when the repository excluded nothing.
+func agentCoverageExcluded(excluded int) string {
+	if excluded <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(", %d excluded by repo ignore rules", excluded)
+}
+
+// agentDiagnosticVisibility splits maxAgentDiagnostics slots between warnings
+// and failures. requiredFailures is a floor failuresVisible must reach
+// whenever there are at least that many failures: the repo-ignore shortfall
+// failures a single run can emit together (E_REPO_IGNORE_GIT_UNAVAILABLE,
+// E_REPO_IGNORE_COUNT_INCOMPLETE, ...) each qualify the coverage line's X<n>
+// count in a way the others do not stand in for, so showing only one of two
+// leaves that count looking exact when it is actually a lower bound. Callers
+// with no such floor pass 0; at least one failure of any kind is still
+// guaranteed visible whenever one exists, as before this parameter existed.
+func agentDiagnosticVisibility(warnings, failures, requiredFailures, limit int) (int, int) {
 	if limit <= 0 {
 		return 0, 0
 	}
-	warningsVisible := minIntCLI(warnings, limit)
+	if failures > 0 && requiredFailures < 1 {
+		requiredFailures = 1
+	}
+	requiredFailures = minIntCLI(requiredFailures, minIntCLI(failures, limit))
+	warningsVisible := minIntCLI(warnings, limit-requiredFailures)
 	failuresVisible := minIntCLI(failures, limit-warningsVisible)
-	if failures > 0 && failuresVisible == 0 {
-		warningsVisible--
-		failuresVisible = 1
+	if failuresVisible < requiredFailures {
+		failuresVisible = requiredFailures
+		warningsVisible = minIntCLI(warnings, limit-failuresVisible)
 	}
 	return warningsVisible, failuresVisible
 }
@@ -1628,22 +2122,99 @@ func agentSearchLineIsLocator(line []byte) bool {
 	return true
 }
 
+// fitAgentSearchResults returns the widest ranked block that fits the byte
+// budget. The rendered block is escaped before it is measured: it is the block
+// that carries repository source, so it is the block whose printed size differs
+// most from its raw size, and measuring the raw form was how a snippet of ESC
+// bytes overran the cap.
+//
+// When the escaped form overruns, the SIZE of the render is what has to come
+// down, not only the NUMBER of results. Dropping results alone leaves nothing
+// to drop for a single hit, so one snippet of control bytes took the whole
+// ranked block to nil, every prefix variant in writeAgentSearchPayload failed
+// with it, and the payload fell through to the telemetry tail: a larger budget
+// bought a strictly worse answer, and the agent got no location at all. The
+// locator itself always fits — searchResultOnOneLine escapes the path and name
+// before they are ever measured, so the header cannot expand — which is exactly
+// why re-rendering smaller reaches an answer where dropping results cannot.
 func fitAgentSearchResults(results []sem.SearchResult, budget int) []byte {
 	if budget <= 0 {
-		return renderAgentSearchResults(results, nil)
+		return termsafe.Bytes(renderAgentSearchResults(results, nil))
 	}
 	for count := len(results); count > 0; count-- {
-		available := budget - (count - 1)
-		if available <= 0 {
-			continue
-		}
-		resultBudgets := rankedAgentSearchBudgets(count, available)
-		formatted := renderAgentSearchResults(results[:count], resultBudgets)
-		if len(formatted) <= budget {
-			return formatted
+		// The separators between blocks are the caller's bytes too, so
+		// `available` is what the RESULTS themselves may spend.
+		separators := count - 1
+		for available := budget - separators; available > 0; {
+			rendered := renderAgentSearchResults(results[:count], rankedAgentSearchBudgets(count, available))
+			if len(rendered) == 0 {
+				break // nothing renderable this narrow; drop a result instead
+			}
+			formatted := termsafe.Bytes(rendered)
+			if len(formatted) <= budget {
+				return formatted
+			}
+			// Retry at the width the OBSERVED expansion implies, scaled from
+			// what this attempt actually PRODUCED rather than from what it was
+			// allowed to: a block that came in under its budget would otherwise
+			// be re-rendered unchanged forever. len(formatted) exceeds budget
+			// here, so the scaled width is strictly smaller than the produced
+			// one and the loop always terminates — while staying proportional
+			// keeps it from collapsing past the widths that would have fitted,
+			// since no byte escapes to more than six (termsafe.appendEscapedAt).
+			// int64 because the product of two caller-supplied byte counts
+			// overflows a 32-bit int.
+			next := int(int64(len(rendered))*int64(budget)/int64(len(formatted))) - separators
+			if next >= available {
+				next = available - 1 // belt and braces: never fail to make progress
+			}
+			available = next
 		}
 	}
 	return nil
+}
+
+// agentSearchSafeBlockPair escapes a renderer's full/compact pair in one step,
+// so both variants of a block are measured in the form they are printed in.
+func agentSearchSafeBlockPair(full, compact []byte) ([]byte, []byte) {
+	return termsafe.Bytes(full), termsafe.Bytes(compact)
+}
+
+// agentSearchEmittedQuarantinedLines restates the quarantine's produced lines in the form this
+// renderer emits them, so the disclosure sink compares like with like.
+//
+// searchPayloadDisclosesItsQuarantine asks whether a FINISHED payload line opens a line the
+// quarantine produced, and it is exact by design: the produced set is what separates a line this
+// response rewrote from one an honest file already held indented. Exactness only holds while both
+// sides are the same bytes. This renderer escapes every block before it measures it, so a produced
+// line carrying a control byte arrives in the payload as its escaped spelling and is not the raw
+// line any more; the lookup then missed, the sink answered "nothing to disclose", and a notice-free
+// rung carrying the quarantined line was accepted. Escaping the set makes the sink ask about the
+// bytes the reader receives.
+//
+// It is a no-op on every line that carries no control byte — the overwhelming case and every line
+// the existing forgery suite is built from — because termsafe.Bytes returns its input unchanged
+// there. The sort is redone because escaping reorders: `\x1b` sorts where a backslash sorts, not
+// where an ESC does, and searchProducedLineOpensWith binary-searches this slice.
+func agentSearchEmittedQuarantinedLines(produced []string) []string {
+	emitted := make([]string, 0, len(produced))
+	for _, line := range produced {
+		emitted = append(emitted, agentSearchEmittedLine(line))
+	}
+	slices.Sort(emitted)
+	return slices.Compact(emitted)
+}
+
+// agentSearchEmittedLine escapes one line the way the block that carries it is escaped.
+//
+// The line is escaped WITH ITS NEWLINE and the newline is then dropped, because termsafe reads one
+// byte past a CR to decide it: a CR followed by LF is a Windows line ending and is kept, a lone CR
+// is an overwrite and is escaped. A body line ending in CR is followed by its LF in the block, so
+// escaping the line on its own would rewrite a CR the payload keeps raw and produce a set entry no
+// payload line can match — the same miss this function exists to remove, one byte further along.
+func agentSearchEmittedLine(line string) string {
+	escaped := termsafe.Bytes([]byte(line + "\n"))
+	return string(escaped[:len(escaped)-1])
 }
 
 func rankedAgentSearchBudgets(count, budget int) []int {
@@ -1874,6 +2445,7 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 	// head result comes back as half a function.
 	flags := searchFlags{Format: "json", Profile: "fast", Worktree: true, MaxContextBytes: defaultSearchContextBytes}
 	var rest []string
+	var queryProvided bool
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--repo":
@@ -1888,6 +2460,7 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 				return flags, nil, err
 			}
 			flags.Query, i = value, next
+			queryProvided = true
 		case "--format":
 			value, next, err := searchFlagValue(args, i)
 			if err != nil {
@@ -1924,8 +2497,10 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 				return flags, nil, err
 			}
 			flags.MaxSnippetLines, i = value, next
+		// --body-head-ranks N: 0 is the DEFINED "built-in depth" value (see
+		// SearchOptions.BodyHeadRanks), so it parses like the flag above.
 		case "--body-head-ranks":
-			value, next, err := searchPositiveIntFlag(args, i)
+			value, next, err := searchNonNegativeIntFlag(args, i)
 			if err != nil {
 				return flags, nil, err
 			}
@@ -1938,8 +2513,12 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 				return flags, nil, err
 			}
 			flags.HeadWindowLines, i = value, next
+		// --enclosure-context-lines N: 0 is the DEFINED "no padding" value (see
+		// SearchOptions.EnclosureContextLines), so it is parsed as a non-negative
+		// integer. Rejecting it made a configuration that serializes the default
+		// explicitly fail before searching.
 		case "--enclosure-context-lines":
-			value, next, err := searchPositiveIntFlag(args, i)
+			value, next, err := searchNonNegativeIntFlag(args, i)
 			if err != nil {
 				return flags, nil, err
 			}
@@ -2052,7 +2631,13 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 		case "--head":
 			flags.Worktree = false
 		default:
-			rest = append(rest, args[i])
+			// A single trailing argument is shorthand for --query. Never consume
+			// unknown flags or override an explicitly supplied (even empty) query.
+			if i == len(args)-1 && !queryProvided && len(rest) == 0 && !strings.HasPrefix(args[i], "-") {
+				flags.Query = args[i]
+			} else {
+				rest = append(rest, args[i])
+			}
 		}
 	}
 	return flags, rest, nil
