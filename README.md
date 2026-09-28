@@ -248,3 +248,7 @@ or open a pull request. Thank you! ❤️
 ## License
 
 Entire Graph is distributed under the [MIT License](LICENSE).
+
+---
+
+[中文说明文档](README.zh-CN.md) | [Chinese README](README.zh-CN.md)
